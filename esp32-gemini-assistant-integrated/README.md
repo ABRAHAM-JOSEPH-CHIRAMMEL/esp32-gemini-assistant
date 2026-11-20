@@ -7,7 +7,10 @@ Deploy this folder as the Render service root directory using Node 22.
 Keep these existing variables:
 - `GEMINI_API_KEY` — Gemini API key (secret)
 - `DEVICE_TOKEN` — long random device token (secret)
-- `GEMINI_MODEL` — keep the model currently configured for this service
+- `GEMINI_MODEL` — primary model (default `gemini-3.8-flash`)
+- `GEMINI_ALTERNATE_MODEL` — optional different model on the same Google AI project, useful when a model-specific quota is exhausted
+- `GEMINI_API_KEY_FALLBACK` — optional key from a separate Google AI project with its own quota
+- `GEMINI_FALLBACK_MODEL` — optional model used with the separate-project fallback key
 
 Optional:
 - `MAX_OUTPUT_TOKENS` — answer generation token ceiling; default 8192
@@ -35,7 +38,7 @@ Both solve endpoints accept multipart form data:
 
 The response keeps the existing `answer` field for API compatibility and adds `questionCount`, `questionNumbers`, `questionInventory`, `missingQuestions`, `unclearQuestions`, `completenessVerified`, and audit metadata.
 
-A successful HTTP response does not mean the answer is complete. The client must check `completenessVerified`, review missing/unreadable items, and treat `finishReason: "MAX_TOKENS"` as incomplete. Gemini can misread scans or audits; human review is still required. Multi-stage processing uses multiple Gemini requests and can consume API quota.
+A successful HTTP response does not mean the answer is complete. The client must check `completenessVerified`, review missing/unreadable items, and treat `finishReason: "MAX_TOKENS"` as incomplete. Gemini can misread scans or audits; human review is still required. The answer is preserved and returned if the optional audit or repair stage runs out of quota. Extraction and answer generation still require Gemini capacity. Retries help with short transient rate limits; they cannot overcome exhausted daily quota, billing restrictions or a Google-side outage. A separately quota-managed alternate model or API project is required for failover.
 
 ## Local validation
 
