@@ -1,12 +1,15 @@
 
 import express from "express";
 import multer from "multer";
-import { fileTypeFromBuffer } from "file-type";
-import { timingSafeEqual } from "node:crypto";
-import { rateLimit } from "express-rate-limit";
 import { GoogleGenAI } from "@google/genai";
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { timingSafeEqual } from "node:crypto";
+
+// ======================================================
+// SERVER CONFIGURATION
+// ======================================================
 
 const app = express();
 
@@ -15,35 +18,79 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT, "public");
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-const MAX_PROMPT_LENGTH = 2000;
+const MAX_PROMPT_LENGTH = 16000;
+
+const MODEL =
+  process.env.GEMINI_MODEL || "gemini-3.6-flash";
+
 const MAX_OUTPUT_TOKENS = Number(
   process.env.MAX_OUTPUT_TOKENS || 8192
 );
 
-const ALLOWED_TYPES = new Set([
-  "image/jpeg",
-  "image/png",
-  "image/webp"
-]);
-
 app.disable("x-powered-by");
-app.use(express.json({ limit: "16kb" }));
+app.use(express.json({ limit: "32kb" }));
 
-// CORS is deliberately not enabled here.
-// The simulator and API are hosted on the SAME Render origin.
-// Same-origin requests do not require CORS.
-// The ESP32 HTTP client also does not require browser CORS.
+// ======================================================
+// SAME-ORIGIN BROWSER CONFIGURATION
+// ======================================================
 
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 10,
-  standardHeaders: "draft-8",
-  legacyHeaders: false,
-  message: {
-    success: false,
-    error: "Too many requests. Please wait and retry."
+// The simulator and API are hosted on the same Render
+// website. Browser requests to this same origin do not
+// require CORS middleware.
+
+app.use(express.static(PUBLIC_DIR));
+
+// ======================================================
+// REQUEST RATE LIMITING
+// ======================================================
+
+const requestCounts = new Map();
+
+function rateLimit(req, res, next) {
+  const now = Date.now();
+  const windowMs = 60 * 1000;
+  const maxRequests = 10;
+
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+
+  let record = requestCounts.get(ip);
+
+  if (!record || now - record.start > windowMs) {
+    record = {
+      start: now,
+      count: 0
+    };
   }
-});
+
+  record.count++;
+  requestCounts.set(ip, record);
+
+  if (record.count > maxRequests) {
+    return res.status(429).json({
+      success: false,
+      error: "Too many requests. Please wait one minute and retry."
+    });
+  }
+
+  // Prevent the in-memory map from growing indefinitely.
+  if (requestCounts.size > 5000) {
+    for (const [key, value] of requestCounts) {
+      if (now - value.start > windowMs) {
+        requestCounts.delete(key);
+      }
+    }
+  }
+
+  next();
+}
+
+// ======================================================
+// IMAGE UPLOAD CONFIGURATION
+// ======================================================
+
+// FIX: Increased fields and parts limits.
+// The simulator may send the image, prompt and other
+// form fields in the same multipart request.
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -51,13 +98,19 @@ const upload = multer({
   limits: {
     fileSize: MAX_IMAGE_BYTES,
     files: 1,
-    fields: 1,
-    parts: 2,
+    fields: 15,
+    parts: 20,
     fieldSize: MAX_PROMPT_LENGTH
   },
 
   fileFilter(req, file, callback) {
-    if (!ALLOWED_TYPES.has(file.mimetype)) {
+    const allowedTypes = [
+      "image/jpeg",
+      "image/png",
+      "image/webp"
+    ];
+
+    if (!allowedTypes.includes(file.mimetype)) {
       return callback(
         new Error("Only JPG, PNG and WEBP images are accepted.")
       );
@@ -68,8 +121,51 @@ const upload = multer({
 });
 
 // ======================================================
-// PERMANENT DEFAULT GEMINI INSTRUCTION
-// Applied automatically to every image scan.
+// IMAGE SIGNATURE VALIDATION
+// No additional npm package required.
+// ======================================================
+
+function detectImageType(buffer) {
+  if (!Buffer.isBuffer(buffer)) return null;
+
+  // JPEG
+  if (
+    buffer.length >= 3 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff
+  ) {
+    return "image/jpeg";
+  }
+
+  // PNG
+  if (
+    buffer.length >= 8 &&
+    buffer.subarray(0, 8).equals(
+      Buffer.from([
+        0x89, 0x50, 0x4e, 0x47,
+        0x0d, 0x0a, 0x1a, 0x0a
+      ])
+    )
+  ) {
+    return "image/png";
+  }
+
+  // WEBP
+  if (
+    buffer.length >= 12 &&
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  return null;
+}
+
+// ======================================================
+// PERMANENT GEMINI INSTRUCTION
+// This instruction is automatically applied to every scan.
 // ======================================================
 
 const DEFAULT_GEMINI_PROMPT = `
@@ -86,14 +182,14 @@ detailed, examination-ready educational answers.
 
 - Examine the entire uploaded image.
 - Identify every readable question.
-- Preserve the original question numbers.
+- Preserve original question numbers.
 - Preserve module numbers and subquestion labels.
 - Answer every question in the original order.
 - Answer BOTH sides of every OR alternative.
 - Do not skip questions at the bottom of the image.
-- Do not combine separate questions into one answer.
+- Do not combine separate questions.
 - Do not invent unreadable text.
-- If a question is unclear, explicitly identify it.
+- Explicitly identify unclear questions.
 
 2. EXAMINATION-READY ANSWERS
 
@@ -111,7 +207,7 @@ Include relevant:
 - Comparisons
 - Important technical points
 
-Cover the relevant marking points as completely as possible.
+Cover relevant marking points as completely as possible.
 Do not guarantee a particular examination score.
 
 3. NUMERICAL PROBLEMS
@@ -121,11 +217,11 @@ For every numerical problem, provide:
 - Given data
 - Required quantity
 - Relevant formula
-- Formula explanation where necessary
+- Explanation of the formula
 - Substitution of values
 - Step-by-step calculations
 - Correct units
-- Clearly highlighted final answer
+- Clearly identified final answer
 
 Never skip calculation steps.
 
@@ -160,6 +256,7 @@ Use proper LaTeX commands for:
 - Derivatives
 
 Examples:
+
 \\alpha
 \\beta
 \\lambda
@@ -205,7 +302,7 @@ The answer must retain its complete educational meaning.
 
 7. ANSWER ORGANISATION
 
-Use this structure:
+Use this structure where appropriate:
 
 MODULE / SECTION
 
@@ -225,9 +322,7 @@ Derivation / Calculation:
 
 Final result:
 
-Repeat this structure as appropriate for each question.
-
-Keep the original question-paper order.
+Repeat for every question in the original order.
 
 8. COMPLETENESS CHECK
 
@@ -239,9 +334,10 @@ Before finishing:
 - Check numerical calculations.
 - Check derivation steps.
 - Check mathematical notation.
-- Identify any unreadable question.
-- Never claim that all questions are answered
-  if any readable question remains unanswered.
+- Identify unreadable questions.
+
+Never claim that all questions are answered
+if any readable question remains unanswered.
 
 9. OUTPUT LENGTH
 
@@ -261,7 +357,6 @@ Provide accurate, detailed and technically sound answers.
 
 // ======================================================
 // DEVICE TOKEN AUTHENTICATION
-// Used only by the physical ESP32 endpoint.
 // ======================================================
 
 function tokenMatches(given, expected) {
@@ -288,7 +383,7 @@ function authenticateDevice(req, res, next) {
   if (!expectedToken) {
     return res.status(503).json({
       success: false,
-      error: "Device authentication is not configured."
+      error: "Device authentication is not configured on Render."
     });
   }
 
@@ -303,16 +398,6 @@ function authenticateDevice(req, res, next) {
 }
 
 // ======================================================
-// WEBSITE / SIMULATOR
-// ======================================================
-
-app.use(express.static(PUBLIC_DIR));
-
-app.get("/", (req, res) => {
-  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
-});
-
-// ======================================================
 // HEALTH CHECK
 // ======================================================
 
@@ -321,9 +406,10 @@ app.get("/health", (req, res) => {
     ok: true,
     status: "online",
     service: "ESP32 Gemini Study Assistant",
-    model: process.env.GEMINI_MODEL || "gemini-3.6-flash",
-    simulator: "same-origin",
-    permanentPrompt: true
+    model: MODEL,
+    permanentPrompt: true,
+    browserRoute: "/api/browser-solve",
+    deviceRoute: "/api/solve"
   });
 });
 
@@ -336,30 +422,31 @@ async function processImage(req, res) {
     if (!process.env.GEMINI_API_KEY) {
       return res.status(503).json({
         success: false,
-        error: "Gemini API key is not configured on Render."
+        error: "GEMINI_API_KEY is missing from Render environment variables."
       });
     }
 
     if (!req.file) {
       return res.status(400).json({
         success: false,
-        error: "No image received. Please upload an image."
+        error: "No image received. Please select a question-paper image."
       });
     }
 
-    // Verify the actual file signature.
-    const detected = await fileTypeFromBuffer(req.file.buffer);
+    const detectedType = detectImageType(req.file.buffer);
 
     if (
-      !detected ||
-      !ALLOWED_TYPES.has(detected.mime) ||
-      detected.mime !== req.file.mimetype
+      !detectedType ||
+      detectedType !== req.file.mimetype
     ) {
       return res.status(415).json({
         success: false,
-        error: "Invalid or unsupported image file."
+        error: "The uploaded image is invalid or unsupported."
       });
     }
+
+    // Optional extra user instruction.
+    // The permanent instruction is always applied regardless.
 
     const additionalPrompt =
       typeof req.body?.prompt === "string"
@@ -373,7 +460,6 @@ async function processImage(req, res) {
       });
     }
 
-    // Permanent instruction is ALWAYS included.
     const finalPrompt =
       DEFAULT_GEMINI_PROMPT +
       (
@@ -383,31 +469,33 @@ async function processImage(req, res) {
           : ""
       );
 
-    const model =
-      process.env.GEMINI_MODEL || "gemini-3.6-flash";
-
     const ai = new GoogleGenAI({
       apiKey: process.env.GEMINI_API_KEY
     });
 
-    console.log("Starting Gemini question-paper scan:", {
-      model,
-      imageType: detected.mime,
+    console.log("Starting question-paper scan:", {
+      model: MODEL,
+      imageType: detectedType,
       imageSize: req.file.size
     });
 
     const result = await ai.models.generateContent({
-      model,
+      model: MODEL,
 
       contents: [
         {
-          text: finalPrompt
-        },
-        {
-          inlineData: {
-            mimeType: detected.mime,
-            data: req.file.buffer.toString("base64")
-          }
+          role: "user",
+          parts: [
+            {
+              text: finalPrompt
+            },
+            {
+              inlineData: {
+                mimeType: detectedType,
+                data: req.file.buffer.toString("base64")
+              }
+            }
+          ]
         }
       ],
 
@@ -430,7 +518,7 @@ async function processImage(req, res) {
       result.candidates?.[0]?.finishReason || null;
 
     console.log("Gemini scan completed:", {
-      model,
+      model: MODEL,
       answerCharacters: answer.length,
       finishReason
     });
@@ -438,7 +526,7 @@ async function processImage(req, res) {
     return res.json({
       success: true,
       answer,
-      model,
+      model: MODEL,
       finishReason
     });
 
@@ -485,26 +573,25 @@ async function processImage(req, res) {
 }
 
 // ======================================================
-// API ROUTES
-// ======================================================
-
-// Browser simulator:
+// BROWSER SIMULATOR ROUTE
 // No DEVICE_TOKEN required.
-// Uses same-origin requests from the Render website.
+// ======================================================
 
 app.post(
   "/api/browser-solve",
-  limiter,
+  rateLimit,
   upload.single("image"),
   processImage
 );
 
-// Physical ESP32:
-// DEVICE_TOKEN authentication is required.
+// ======================================================
+// PHYSICAL ESP32 ROUTE
+// DEVICE_TOKEN REQUIRED.
+// ======================================================
 
 app.post(
   "/api/solve",
-  limiter,
+  rateLimit,
   authenticateDevice,
   upload.single("image"),
   processImage
@@ -519,27 +606,45 @@ app.use((error, req, res, next) => {
     return next(error);
   }
 
-  if (error instanceof multer.MulterError) {
-    const status =
-      error.code === "LIMIT_FILE_SIZE" ? 413 : 400;
-
-    return res.status(status).json({
-      success: false,
-      error: error.message
-    });
-  }
-
   console.error(
     "Request error:",
     error?.message || error
   );
 
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        success: false,
+        error: "Image exceeds the 5 MB upload limit."
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      error: `Upload error: ${error.message}`
+    });
+  }
+
   return res.status(error.status || 400).json({
     success: false,
-    error:
-      error.status === 413
-        ? "Request too large."
-        : error.message || "Request could not be processed."
+    error: error.message || "Request could not be processed."
+  });
+});
+
+// ======================================================
+// ROOT FALLBACK
+// ======================================================
+
+app.get("/", (req, res) => {
+  const indexFile = path.join(PUBLIC_DIR, "index.html");
+
+  if (fs.existsSync(indexFile)) {
+    return res.sendFile(indexFile);
+  }
+
+  return res.json({
+    status: "online",
+    service: "ESP32 Gemini Study Assistant"
   });
 });
 
@@ -550,8 +655,8 @@ app.use((error, req, res, next) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Gemini server running on port ${PORT}`);
   console.log("Permanent study assistant prompt loaded.");
-  console.log("Simulator: /");
-  console.log("ESP32 route: /api/solve");
   console.log("Browser route: /api/browser-solve");
+  console.log("ESP32 route: /api/solve");
+  console.log("Multipart limits: 1 image, 15 fields, 20 total parts.");
   console.log("Same-origin browser requests: CORS not required.");
 });
