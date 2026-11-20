@@ -253,15 +253,33 @@ document.getElementById('clear').onclick=()=>{
  fileInput.value='';const img=document.getElementById('preview');img.removeAttribute('src');img.style.display='none';
  message.textContent='Image cleared.';
 };
+async function prepareUploadImage(file){
+ // Resize oversized phone photos locally; preserve small screenshots unchanged.
+ if(!('createImageBitmap' in window) || !file.type.startsWith('image/')) return file;
+ const bitmap=await createImageBitmap(file);
+ const maxDimension=1800;
+ const scale=Math.min(1,maxDimension/Math.max(bitmap.width,bitmap.height));
+ if(scale===1 && file.size<=1200*1024){bitmap.close();return file;}
+ const canvas=document.createElement('canvas');
+ canvas.width=Math.max(1,Math.round(bitmap.width*scale));
+ canvas.height=Math.max(1,Math.round(bitmap.height*scale));
+ const ctx=canvas.getContext('2d',{alpha:false});
+ ctx.drawImage(bitmap,0,0,canvas.width,canvas.height);
+ bitmap.close();
+ const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',0.84));
+ if(!blob) return file;
+ // Use compressed JPEG only when it actually reduces transfer size.
+ return blob.size<file.size ? new File([blob],file.name.replace(/\\.[^.]+$/,'')+'.jpg',{type:'image/jpeg',lastModified:Date.now()}) : file;
+}
 document.getElementById('scan').onclick=async()=>{
  const file=fileInput.files[0];
  if(!file){message.textContent='Select a question-paper image first.';return}
  const btn=document.getElementById('scan');btn.disabled=true;btn.textContent='SCANNING...';
  message.textContent='Uploading image to Render. The first request may take a little longer if the free service is waking up...';
  try{
-  const form=new FormData();form.append('image',file,file.name);
+  message.textContent='Preparing image for faster upload...';\n  const uploadFile=await prepareUploadImage(file);\n  const form=new FormData();form.append('image',uploadFile,uploadFile.name);
   const extra=document.getElementById('prompt').value.trim();if(extra)form.append('prompt',extra);
-  const response=await fetch(API_URL,{method:'POST',body:form});
+  message.textContent='Uploading '+(uploadFile.size/1024).toFixed(0)+' KB to Render and processing the paper...';\n  const response=await fetch(API_URL,{method:'POST',body:form});
   const raw=await response.text();let data;
   try{data=JSON.parse(raw)}catch{throw new Error('Server returned a non-JSON response: '+raw.slice(0,350))}
   if(!response.ok)throw new Error(data.error||data.message||('HTTP '+response.status));
