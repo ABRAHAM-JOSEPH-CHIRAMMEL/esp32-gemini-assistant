@@ -2,106 +2,252 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import { fileTypeFromBuffer } from "file-type";
+import { timingSafeEqual } from "node:crypto";
+import { rateLimit } from "express-rate-limit";
 import { GoogleGenAI } from "@google/genai";
-import crypto from "crypto";
-
-// ======================================================
-// 1. SERVER CONFIGURATION
-// ======================================================
 
 const app = express();
-
 const PORT = process.env.PORT || 10000;
 
-const API_KEY = process.env.GEMINI_API_KEY;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_USER_PROMPT_LENGTH = 2000;
+const MAX_OUTPUT_TOKENS = 8192;
 
-const MODEL =
-  process.env.GEMINI_MODEL || "gemini-3.6-flash";
+const ALLOWED_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp"
+]);
 
-const DEVICE_TOKEN = process.env.DEVICE_TOKEN;
+app.disable("x-powered-by");
+app.use(express.json({ limit: "16kb" }));
 
-const MAX_FILE_SIZE = 5 * 1024 * 1024;
+// --------------------------------------------------
+// PERMANENT DEFAULT GEMINI INSTRUCTION
+// --------------------------------------------------
 
-const MAX_RETRIES = 3;
+const DEFAULT_PROMPT = `
+You are an expert educational assistant specialising in
+engineering subjects and university examination question papers.
 
-const genAI = API_KEY
-  ? new GoogleGenAI({ apiKey: API_KEY })
-  : null;
+Your task is to read the uploaded question paper and provide
+accurate, detailed, examination-ready educational answers.
 
-// ======================================================
-// 2. CORS - IMPORTANT FIX
-// ======================================================
+==================================================
+1. COMPLETE QUESTION PAPER COVERAGE
+==================================================
 
-// Allows requests from:
-// - Local HTML files (Origin: null)
-// - GitHub Pages
-// - Render-hosted frontends
-// - Other browser applications
-//
-// Do not enable credentials with wildcard origin.
+- Examine the entire uploaded question paper carefully.
+- Identify EVERY visible question and subquestion.
+- Preserve original question numbers, module numbers,
+  subquestion labels and marks wherever visible.
+- Answer every question in exactly the original order.
+- Include all questions marked OR.
+- Answer BOTH sides of every OR alternative separately.
+- Never skip numerical problems, derivations or short questions.
+- Include questions at the bottom of the image.
+- Never invent unreadable or missing question text.
+- Identify unclear questions and explain that a clearer image
+  is required.
 
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "x-device-token"
-    ],
-    optionsSuccessStatus: 204
-  })
-);
+==================================================
+2. EXAMINATION-READY ANSWER QUALITY
+==================================================
 
-// CORS middleware above handles OPTIONS preflight.
-// Do not add an Express wildcard OPTIONS route here.
+- Provide detailed, technically correct answers.
+- Aim to cover all relevant marking points for the marks allotted.
+- Include definitions, principles, explanations and applications.
+- Include relevant formulas and important technical details.
+- Explain the reasoning behind important results.
+- Include labelled diagrams or clear diagram descriptions
+  wherever required.
+- Use comparison tables where appropriate in the full answer.
+- Do not unnecessarily shorten high-mark answers.
+- Do not fabricate facts, values or assumptions.
+- Prioritise correctness, completeness and clarity.
 
-app.use(express.json({ limit: "8mb" }));
+Do not guarantee full marks. Provide the most complete,
+accurate answer supported by the question.
 
-app.use(express.urlencoded({
-  extended: true,
-  limit: "8mb"
+==================================================
+3. NUMERICAL PROBLEMS
+==================================================
+
+For every numerical problem, provide:
+
+1. Given data.
+2. Required quantity.
+3. Relevant formula.
+4. Substitution of values.
+5. Step-by-step calculation.
+6. Correct units.
+7. Clearly identified final answer.
+
+Never provide only the final numerical result.
+Do not omit important calculation steps.
+
+==================================================
+4. MATHEMATICAL FORMATTING
+==================================================
+
+Use standard mathematical notation.
+
+- Use LaTeX notation for equations and mathematical expressions.
+- Use \\( ... \\) for inline mathematics.
+- Use $$ ... $$ for displayed equations.
+- Use Greek letters with proper commands:
+  \\alpha, \\beta, \\lambda, \\psi, \\theta, \\pi, \\Delta.
+- Use proper fractions: \\frac{a}{b}.
+- Use integrals: \\int.
+- Use summations: \\sum.
+- Use vectors: \\vec{E}.
+- Use subscripts: \\beta_{phase}.
+- Use superscripts, powers, matrices and derivatives correctly.
+- Never spell Greek symbols as English words inside equations.
+- Never replace a mathematical expression with an incorrect
+  plain-text approximation.
+- Preserve mathematical meaning and derivation steps.
+
+==================================================
+5. DERIVATIONS
+==================================================
+
+For every derivation:
+
+1. State the required result.
+2. State the governing principle or starting equation.
+3. Explain assumptions where applicable.
+4. Show each important mathematical step.
+5. Explain substitutions and transformations.
+6. Highlight the final derived expression.
+
+Do not jump directly to the final result.
+
+==================================================
+6. OLED DISPLAY COMPATIBILITY
+==================================================
+
+The physical display is a 0.91-inch OLED with
+128 x 32 pixel resolution.
+
+The firmware displays approximately four lines at a time.
+
+Therefore:
+
+- Use short, readable lines.
+- Avoid excessively wide equations.
+- Break long equations into logical steps.
+- Avoid wide tables in the OLED-oriented answer.
+- Preserve question numbering and mathematical meaning.
+- Avoid unnecessary decorative characters.
+- Avoid excessively long unbroken words or expressions.
+- Keep explanatory sentences suitable for a narrow display.
+- Organise the answer for sequential scrolling.
+- Do not remove important answer content just to fit
+  one OLED screen.
+- Do not sacrifice derivation steps or numerical calculations.
+
+IMPORTANT:
+The answer must remain complete. The OLED firmware is
+responsible for wrapping and scrolling the complete response.
+
+Retain mathematically correct notation in the answer.
+Do not silently replace mathematical symbols with words.
+
+==================================================
+7. COMPLETION CHECK
+==================================================
+
+Before finishing:
+
+- Verify every detected question has an answer.
+- Verify both sides of every OR alternative are covered.
+- Verify all numerical calculations are complete.
+- Verify important derivation steps are present.
+- Verify mathematical notation is correct.
+- Identify unreadable or partially visible questions.
+- Do not claim the paper is complete if questions remain.
+
+==================================================
+8. OUTPUT LENGTH AND CONTINUATION
+==================================================
+
+- Prioritise completeness over brevity.
+- Do not deliberately omit questions to shorten the response.
+- Answer in the original question-paper sequence.
+- If the response limit is approaching, finish at a logical
+  question boundary and identify the next unanswered question.
+- Never repeat completed answers unnecessarily.
+- Never claim that unanswered questions have been completed.
+
+FINAL REQUIREMENT:
+
+Answer the complete readable question paper from beginning
+to end, preserving its original order.
+
+Include every visible question, every OR alternative,
+detailed derivations, complete numerical solutions,
+correct mathematical notation and clear explanations.
+`;
+
+// --------------------------------------------------
+// CORS CONFIGURATION
+// --------------------------------------------------
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    // Requests without an Origin header include ESP32 requests.
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error("Origin not allowed."));
+  },
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "x-device-token"]
 }));
 
-// ======================================================
-// 3. GEMINI INITIALIZATION CHECK
-// ======================================================
+// --------------------------------------------------
+// RATE LIMITING
+// --------------------------------------------------
 
-function checkGemini() {
-  if (!API_KEY || !genAI) {
-    const error = new Error(
-      "GEMINI_API_KEY is missing. Configure it in Render Environment."
-    );
-
-    error.status = 503;
-    throw error;
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    error: "Too many requests. Please try again shortly."
   }
-}
+});
 
-// ======================================================
-// 4. IMAGE UPLOAD CONFIGURATION
-// ======================================================
+// --------------------------------------------------
+// IMAGE UPLOAD CONFIGURATION
+// --------------------------------------------------
 
 const upload = multer({
   storage: multer.memoryStorage(),
-
   limits: {
-    fileSize: MAX_FILE_SIZE,
-    files: 1
+    fileSize: MAX_IMAGE_BYTES,
+    files: 1,
+    fields: 1,
+    parts: 2,
+    fieldSize: MAX_USER_PROMPT_LENGTH
   },
-
-  fileFilter: (req, file, callback) => {
-    const allowed = [
-      "image/jpeg",
-      "image/png",
-      "image/webp"
-    ];
-
-    if (!allowed.includes(file.mimetype)) {
+  fileFilter(req, file, callback) {
+    if (!ALLOWED_TYPES.has(file.mimetype)) {
       return callback(
-        new Error(
-          "Invalid image format. Use JPEG, PNG or WebP."
-        )
+        new Error("Only JPG, PNG and WEBP images are accepted.")
       );
     }
 
@@ -109,645 +255,275 @@ const upload = multer({
   }
 });
 
-// Support common frontend field names.
-const imageUpload = upload.fields([
-  { name: "image", maxCount: 1 },
-  { name: "file", maxCount: 1 },
-  { name: "photo", maxCount: 1 }
-]);
+// --------------------------------------------------
+// DEVICE AUTHENTICATION
+// --------------------------------------------------
 
-function getUploadedFile(req) {
-  if (!req.files) return null;
-
-  return (
-    req.files.image?.[0] ||
-    req.files.file?.[0] ||
-    req.files.photo?.[0] ||
-    null
-  );
-}
-
-// ======================================================
-// 5. IMAGE VALIDATION
-// ======================================================
-
-function validateImage(buffer, mimeType) {
-  if (!buffer || buffer.length < 12) {
+function tokenMatches(provided, expected) {
+  if (
+    typeof provided !== "string" ||
+    typeof expected !== "string"
+  ) {
     return false;
   }
 
-  if (mimeType === "image/jpeg") {
-    return (
-      buffer[0] === 0xff &&
-      buffer[1] === 0xd8 &&
-      buffer[2] === 0xff
-    );
+  const a = Buffer.from(provided, "utf8");
+  const b = Buffer.from(expected, "utf8");
+
+  if (a.length !== b.length) {
+    return false;
   }
 
-  if (mimeType === "image/png") {
-    return (
-      buffer[0] === 0x89 &&
-      buffer[1] === 0x50 &&
-      buffer[2] === 0x4e &&
-      buffer[3] === 0x47 &&
-      buffer[4] === 0x0d &&
-      buffer[5] === 0x0a &&
-      buffer[6] === 0x1a &&
-      buffer[7] === 0x0a
-    );
-  }
-
-  if (mimeType === "image/webp") {
-    return (
-      buffer.toString("ascii", 0, 4) === "RIFF" &&
-      buffer.toString("ascii", 8, 12) === "WEBP"
-    );
-  }
-
-  return false;
+  return timingSafeEqual(a, b);
 }
-
-// ======================================================
-// 6. JSON IMAGE SUPPORT
-// ======================================================
-
-function getImageFromRequest(req) {
-  const uploaded = getUploadedFile(req);
-
-  if (uploaded) {
-    return {
-      buffer: uploaded.buffer,
-      mimeType: uploaded.mimetype
-    };
-  }
-
-  // Also accept JSON base64 images.
-  const rawImage =
-    req.body?.imageBase64 ||
-    req.body?.image;
-
-  if (typeof rawImage !== "string") {
-    return null;
-  }
-
-  let mimeType =
-    req.body?.mimeType || "image/jpeg";
-
-  let base64 = rawImage;
-
-  const dataUrlMatch = rawImage.match(
-    /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/s
-  );
-
-  if (dataUrlMatch) {
-    mimeType = dataUrlMatch[1];
-    base64 = dataUrlMatch[2];
-  }
-
-  if (![
-    "image/jpeg",
-    "image/png",
-    "image/webp"
-  ].includes(mimeType)) {
-    return null;
-  }
-
-  if (
-    base64.length > Math.ceil(MAX_FILE_SIZE * 1.4) ||
-    !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)
-  ) {
-    return null;
-  }
-
-  const buffer = Buffer.from(base64, "base64");
-
-  if (buffer.length > MAX_FILE_SIZE) {
-    const error = new Error(
-      "Image exceeds the 5 MB limit."
-    );
-
-    error.status = 413;
-    throw error;
-  }
-
-  return {
-    buffer,
-    mimeType
-  };
-}
-
-// ======================================================
-// 7. DEVICE AUTHENTICATION
-// ======================================================
 
 function authenticateDevice(req, res, next) {
-  if (!DEVICE_TOKEN) {
+  const expected = process.env.DEVICE_TOKEN;
+
+  if (!expected) {
     return res.status(503).json({
-      success: false,
-      error: "DEVICE_TOKEN is not configured."
+      error: "Device authentication is not configured."
     });
   }
 
-  const supplied = req.headers["x-device-token"];
-
-  if (
-    typeof supplied !== "string" ||
-    supplied.length !== DEVICE_TOKEN.length
-  ) {
+  if (!tokenMatches(req.get("x-device-token"), expected)) {
     return res.status(401).json({
-      success: false,
-      error: "Invalid device authentication."
-    });
-  }
-
-  const valid = crypto.timingSafeEqual(
-    Buffer.from(supplied),
-    Buffer.from(DEVICE_TOKEN)
-  );
-
-  if (!valid) {
-    return res.status(401).json({
-      success: false,
-      error: "Invalid device token."
+      error: "Unauthorized device."
     });
   }
 
   next();
 }
 
-// ======================================================
-// 8. RATE LIMITING
-// ======================================================
-
-const requestCounts = new Map();
-
-function rateLimit(req, res, next) {
-  const ip =
-    req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-    req.socket.remoteAddress ||
-    "unknown";
-
-  const now = Date.now();
-
-  let record = requestCounts.get(ip);
-
-  if (!record || now - record.time > 60000) {
-    record = {
-      count: 0,
-      time: now
-    };
-  }
-
-  record.count++;
-
-  requestCounts.set(ip, record);
-
-  if (record.count > 10) {
-    return res.status(429).json({
-      success: false,
-      error: "Too many requests. Please wait."
-    });
-  }
-
-  next();
-}
-
-const cleanup = setInterval(() => {
-  const now = Date.now();
-
-  for (const [ip, record] of requestCounts) {
-    if (now - record.time > 60000) {
-      requestCounts.delete(ip);
-    }
-  }
-}, 60000);
-
-cleanup.unref();
-
-// ======================================================
-// 9. GEMINI ERROR DETECTION
-// ======================================================
-
-function getErrorStatus(error) {
-  const status = Number(
-    error?.status ||
-    error?.statusCode ||
-    error?.code ||
-    error?.response?.status ||
-    0
-  );
-
-  if (status >= 400 && status <= 599) {
-    return status;
-  }
-
-  const message = String(
-    error?.message || ""
-  ).toUpperCase();
-
-  if (message.includes("UNAVAILABLE")) return 503;
-
-  if (message.includes("RESOURCE_EXHAUSTED")) return 429;
-
-  if (message.includes("DEADLINE_EXCEEDED")) return 504;
-
-  if (message.includes("INVALID_ARGUMENT")) return 400;
-
-  return 500;
-}
-
-// ======================================================
-// 10. AUTOMATIC GEMINI RETRIES
-// ======================================================
-
-async function generateWithRetry(fn) {
-  let lastError;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      console.log(
-        `Gemini attempt ${attempt + 1}/${MAX_RETRIES + 1}`
-      );
-
-      return await fn();
-
-    } catch (error) {
-      lastError = error;
-
-      const status = getErrorStatus(error);
-
-      const retryable = [
-        429,
-        500,
-        503,
-        504
-      ].includes(status);
-
-      if (!retryable || attempt === MAX_RETRIES) {
-        throw error;
-      }
-
-      const delay =
-        1500 * Math.pow(2, attempt) +
-        Math.floor(Math.random() * 500);
-
-      console.log(
-        `Gemini returned ${status}. Retrying after ${delay}ms.`
-      );
-
-      await new Promise(resolve =>
-        setTimeout(resolve, delay)
-      );
-    }
-  }
-
-  throw lastError;
-}
-
-// ======================================================
-// 11. MAIN GEMINI IMAGE ANALYSIS
-// ======================================================
-
-async function analyzeImage(image, customPrompt = "") {
-  checkGemini();
-
-  if (!image) {
-    const error = new Error("No image received.");
-    error.status = 400;
-    throw error;
-  }
-
-  if (!validateImage(image.buffer, image.mimeType)) {
-    const error = new Error(
-      "Image is invalid or corrupted."
-    );
-
-    error.status = 400;
-    throw error;
-  }
-
-  const imageBase64 =
-    image.buffer.toString("base64");
-
-  const prompt = customPrompt.trim() || `
-You are an intelligent visual problem-solving assistant.
-
-Analyze the uploaded image carefully.
-
-If it contains a mathematical question:
-- Read the complete question.
-- Solve it step by step.
-- Show formulas and substitutions.
-- Explain the calculation.
-- Give the final answer clearly.
-
-If it contains an electronics or engineering question:
-- Identify the relevant concepts.
-- Explain the working and derivations.
-- Include equations and units.
-- Provide a clear final answer.
-
-If it contains a circuit, graph, diagram or text:
-- Identify its important elements.
-- Explain what is shown.
-- Do not invent information that cannot be read.
-
-Keep the response accurate, structured and concise.
-`;
-
-  const response = await generateWithRetry(async () => {
-    return await genAI.models.generateContent({
-      model: MODEL,
-
-      contents: [
-        {
-          role: "user",
-
-          parts: [
-            {
-              text: prompt
-            },
-
-            {
-              inlineData: {
-                mimeType: image.mimeType,
-                data: imageBase64
-              }
-            }
-          ]
-        }
-      ],
-
-      config: {
-        maxOutputTokens: 8192,
-        temperature: 0.2
-      }
-    });
-  });
-
-  const answer = response.text || "";
-
-  if (!answer.trim()) {
-    const error = new Error(
-      "Gemini returned an empty response."
-    );
-
-    error.status = 502;
-    throw error;
-  }
-
-  return {
-    success: true,
-    answer: answer,
-    text: answer,
-    model: MODEL,
-    finishReason:
-      response.candidates?.[0]?.finishReason || "UNKNOWN",
-    timestamp: new Date().toISOString()
-  };
-}
-
-// ======================================================
-// 12. CENTRAL ERROR RESPONSE
-// ======================================================
-
-function sendError(res, error) {
-  const status = error.status ||
-    getErrorStatus(error);
-
-  console.error("REQUEST ERROR:", {
-    status,
-    message: error.message
-  });
-
-  let message = error.message ||
-    "An unexpected server error occurred.";
-
-  if (status === 429) {
-    message =
-      "Gemini API rate limit reached. Please wait and try again.";
-  }
-
-  if (status === 503) {
-    message =
-      "Gemini is temporarily unavailable or overloaded. Please retry shortly.";
-  }
-
-  if (status === 504) {
-    message =
-      "Gemini request timed out. Please try again.";
-  }
-
-  if (status === 401 || status === 403) {
-    message =
-      "Gemini authentication failed. Check your API key and permissions.";
-  }
-
-  if (status === 500) {
-    message =
-      "Internal server error: " + message;
-  }
-
-  return res.status(
-    status >= 400 && status <= 599 ? status : 500
-  ).json({
-    success: false,
-    error: message,
-    retryable: [
-      429,
-      500,
-      503,
-      504
-    ].includes(status)
-  });
-}
-
-// ======================================================
-// 13. HOME PAGE
-// ======================================================
+// --------------------------------------------------
+// HEALTH CHECKS
+// --------------------------------------------------
 
 app.get("/", (req, res) => {
   res.json({
-    success: true,
-    message: "ESP32 Gemini Assistant is running.",
-    model: MODEL,
-    endpoints: [
-      "/health",
-      "/api/browser-solve",
-      "/api/solve"
-    ]
+    status: "online",
+    service: "ESP32 Gemini Study Assistant"
   });
 });
-
-// ======================================================
-// 14. HEALTH CHECK
-// ======================================================
 
 app.get("/health", (req, res) => {
   res.json({
-    success: true,
-    status: "online",
-    geminiConfigured: Boolean(API_KEY),
-    model: MODEL,
-    timestamp: new Date().toISOString()
+    ok: true,
+    service: "ESP32 Gemini Study Assistant",
+    model: process.env.GEMINI_MODEL || "gemini-3.6-flash"
   });
 });
 
-// ======================================================
-// 15. BROWSER IMAGE SCANNING
-// POST /api/browser-solve
-// ======================================================
+// --------------------------------------------------
+// SHARED GEMINI IMAGE PROCESSING
+// --------------------------------------------------
 
-app.post(
-  "/api/browser-solve",
-  rateLimit,
-  (req, res, next) => {
-    if (req.is("multipart/form-data")) {
-      return imageUpload(req, res, next);
+async function processQuestionPaper(req, res) {
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+
+    if (!apiKey) {
+      return res.status(503).json({
+        success: false,
+        error: "Gemini API is not configured on Render."
+      });
     }
 
-    next();
-  },
-  async (req, res) => {
-    try {
-      console.log("Browser scan request received.");
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: "No image received. Use the image field."
+      });
+    }
 
-      const image = getImageFromRequest(req);
+    // Verify actual image signature.
+    const detected = await fileTypeFromBuffer(req.file.buffer);
 
-      if (!image) {
-        return res.status(400).json({
-          success: false,
-          error: "No valid image received. Upload using image, file or photo."
-        });
+    if (
+      !detected ||
+      !ALLOWED_TYPES.has(detected.mime) ||
+      detected.mime !== req.file.mimetype
+    ) {
+      return res.status(415).json({
+        success: false,
+        error: "Invalid or unsupported image file."
+      });
+    }
+
+    const userPrompt =
+      typeof req.body?.prompt === "string"
+        ? req.body.prompt.trim()
+        : "";
+
+    if (userPrompt.length > MAX_USER_PROMPT_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        error: "Additional prompt is too long."
+      });
+    }
+
+    // Permanent instruction is ALWAYS included.
+    const finalPrompt = [
+      DEFAULT_PROMPT,
+      userPrompt
+        ? "\nADDITIONAL USER INSTRUCTIONS:\n" + userPrompt
+        : ""
+    ].join("\n");
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    const model =
+      process.env.GEMINI_MODEL || "gemini-3.6-flash";
+
+    console.log("Starting Gemini image processing.");
+    console.log("Model:", model);
+    console.log("Image type:", detected.mime);
+    console.log("Image size:", req.file.size, "bytes");
+
+    const result = await ai.models.generateContent({
+      model,
+      contents: [
+        {
+          text: finalPrompt
+        },
+        {
+          inlineData: {
+            mimeType: detected.mime,
+            data: req.file.buffer.toString("base64")
+          }
+        }
+      ],
+      config: {
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
+        temperature: 0.2
       }
+    });
 
-      const result = await analyzeImage(
-        image,
-        req.body?.prompt || ""
-      );
+    const answer = result.text || "";
 
-      console.log("Browser scan successful.");
-
-      return res.status(200).json(result);
-
-    } catch (error) {
-      return sendError(res, error);
+    if (!answer.trim()) {
+      return res.status(502).json({
+        success: false,
+        error: "Gemini returned an empty answer."
+      });
     }
-  }
-);
 
-// ======================================================
-// 16. ESP32 IMAGE SCANNING
-// POST /api/solve
-// Requires x-device-token
-// ======================================================
+    console.log(
+      "Gemini response received.",
+      "Characters:",
+      answer.length
+    );
+
+    return res.json({
+      success: true,
+      answer,
+      model,
+      truncated: false
+    });
+
+  } catch (error) {
+    const status = Number(error?.status || error?.statusCode || 0);
+
+    console.error(
+      "Gemini processing error:",
+      status,
+      error?.message || "Unknown error"
+    );
+
+    if (status === 429) {
+      return res.status(429).json({
+        success: false,
+        error: "Gemini API quota or rate limit reached. Please wait and retry."
+      });
+    }
+
+    if (status === 503 || status === 502) {
+      return res.status(503).json({
+        success: false,
+        error: "Gemini is temporarily unavailable or overloaded. Please retry."
+      });
+    }
+
+    if (status === 401 || status === 403) {
+      return res.status(status).json({
+        success: false,
+        error: "Gemini API authentication or permission error. Check Render environment variables."
+      });
+    }
+
+    return res.status(502).json({
+      success: false,
+      error: "AI processing failed. Check Render logs."
+    });
+  }
+}
+
+// --------------------------------------------------
+// ESP32 ROUTE - DEVICE TOKEN REQUIRED
+// --------------------------------------------------
 
 app.post(
   "/api/solve",
+  limiter,
   authenticateDevice,
-  rateLimit,
-  (req, res, next) => {
-    if (req.is("multipart/form-data")) {
-      return imageUpload(req, res, next);
-    }
-
-    next();
-  },
-  async (req, res) => {
-    try {
-      console.log("ESP32 scan request received.");
-
-      const image = getImageFromRequest(req);
-
-      if (!image) {
-        return res.status(400).json({
-          success: false,
-          error: "No valid image received."
-        });
-      }
-
-      const result = await analyzeImage(
-        image,
-        req.body?.prompt || ""
-      );
-
-      console.log("ESP32 scan successful.");
-
-      return res.status(200).json(result);
-
-    } catch (error) {
-      return sendError(res, error);
-    }
-  }
+  upload.single("image"),
+  processQuestionPaper
 );
 
-// ======================================================
-// 17. UNKNOWN API ROUTES
-// ======================================================
+// --------------------------------------------------
+// BROWSER ROUTE - NO DEVICE TOKEN REQUIRED
+// --------------------------------------------------
 
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: "Endpoint not found.",
-    path: req.path
-  });
-});
+app.post(
+  "/api/browser-solve",
+  limiter,
+  upload.single("image"),
+  processQuestionPaper
+);
 
-// ======================================================
-// 18. GLOBAL ERROR HANDLER
-// ======================================================
+// --------------------------------------------------
+// ERROR HANDLING
+// --------------------------------------------------
 
 app.use((error, req, res, next) => {
-  console.error("GLOBAL SERVER ERROR:", error);
-
   if (res.headersSent) {
     return next(error);
   }
 
   if (error instanceof multer.MulterError) {
-    if (error.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({
-        success: false,
-        error: "Image exceeds the 5 MB upload limit."
-      });
-    }
+    const status =
+      error.code === "LIMIT_FILE_SIZE" ? 413 : 400;
 
-    return res.status(400).json({
+    return res.status(status).json({
       success: false,
       error: error.message
     });
   }
 
-  if (error.status) {
-    return sendError(res, error);
+  if (error?.message === "Origin not allowed.") {
+    return res.status(403).json({
+      success: false,
+      error: "Browser origin is not allowed. Check ALLOWED_ORIGINS."
+    });
   }
 
-  return res.status(500).json({
+  console.error("Request error:", error?.message || error);
+
+  return res.status(error.status || 400).json({
     success: false,
-    error: error.message || "Internal server error."
+    error: error.status === 413
+      ? "Request too large."
+      : "Request could not be processed."
   });
 });
 
-// ======================================================
-// 19. START SERVER
-// ======================================================
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("");
-  console.log("====================================");
-  console.log(" ESP32 GEMINI ASSISTANT");
-  console.log(" SERVER STARTED SUCCESSFULLY");
-  console.log("====================================");
-
-  console.log("Port:", PORT);
-  console.log("Gemini API:", API_KEY ? "CONFIGURED" : "MISSING");
-  console.log("Gemini Model:", MODEL);
-  console.log("Device Token:", DEVICE_TOKEN ? "CONFIGURED" : "MISSING");
-
-  console.log("------------------------------------");
-  console.log("GET  /");
-  console.log("GET  /health");
-  console.log("POST /api/browser-solve");
-  console.log("POST /api/solve");
-  console.log("====================================");
+  console.log("Gemini server running on port", PORT);
+  console.log("Permanent study assistant prompt loaded.");
+  console.log("ESP32 route: /api/solve");
+  console.log("Browser route: /api/browser-solve");
 });
