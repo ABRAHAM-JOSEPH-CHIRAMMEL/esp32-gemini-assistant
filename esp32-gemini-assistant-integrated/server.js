@@ -415,154 +415,99 @@ app.get("/health", (req, res) => {
 
 async function processImage(req, res) {
   try {
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(503).json({
-        success: false,
-        error: "GEMINI_API_KEY is missing from Render."
-      });
-    }
-
-    if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        error: "No image received. Please select an image."
-      });
-    }
-
+    if (!process.env.GEMINI_API_KEY) return res.status(503).json({ success:false, error:"GEMINI_API_KEY is missing from Render." });
+    if (!req.file) return res.status(400).json({ success:false, error:"No image received. Please select an image." });
     const detectedType = detectImageType(req.file.buffer);
-
-    if (
-      !detectedType ||
-      detectedType !== req.file.mimetype
-    ) {
-      return res.status(415).json({
-        success: false,
-        error: "Invalid or unsupported image file."
-      });
-    }
-
-    const additionalPrompt =
-      typeof req.body?.prompt === "string"
-        ? req.body.prompt.trim()
-        : "";
-
-    if (additionalPrompt.length > MAX_PROMPT_LENGTH) {
-      return res.status(400).json({
-        success: false,
-        error: "Additional instruction is too long."
-      });
-    }
-
-    // The permanent instruction is always applied.
-    const finalPrompt =
-      DEFAULT_GEMINI_PROMPT +
-      (
-        additionalPrompt
-          ? "\n\nADDITIONAL USER INSTRUCTIONS:\n" +
-            additionalPrompt
-          : ""
-      );
-
-    const ai = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY
+    if (!detectedType || detectedType !== req.file.mimetype) return res.status(415).json({ success:false, error:"Invalid or unsupported image file." });
+    const additionalPrompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
+    if (additionalPrompt.length > MAX_PROMPT_LENGTH) return res.status(400).json({ success:false, error:"Additional instruction is too long." });
+    const ai = new GoogleGenAI({ apiKey:process.env.GEMINI_API_KEY });
+    const imagePart = { inlineData:{ mimeType:detectedType, data:req.file.buffer.toString("base64") } };
+    const callGemini = async (parts, tokenLimit=MAX_OUTPUT_TOKENS) => ai.models.generateContent({
+      model:MODEL, contents:[{ role:"user", parts }], config:{ maxOutputTokens:tokenLimit, temperature:0.2 }
     });
-
-    console.log("Starting question-paper scan:", {
-      model: MODEL,
-      imageType: detectedType,
-      imageSize: req.file.size
-    });
-
-    const result = await ai.models.generateContent({
-      model: MODEL,
-
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: finalPrompt
-            },
-            {
-              inlineData: {
-                mimeType: detectedType,
-                data: req.file.buffer.toString("base64")
-              }
-            }
-          ]
-        }
-      ],
-
-      config: {
-        maxOutputTokens: MAX_OUTPUT_TOKENS,
-        temperature: 0.2
-      }
-    });
-
-    const answer = result.text || "";
-
-    if (!answer.trim()) {
-      return res.status(502).json({
-        success: false,
-        error: "Gemini returned an empty answer."
-      });
+    const parseJson = (raw) => {
+      const value=String(raw||"").replace(/^```(?:json)?\s*/i,"").replace(/\s*```$/ ,"").trim();
+      const first=value.indexOf("{"), last=value.lastIndexOf("}");
+      if(first<0||last<=first) throw new Error("Gemini did not return valid JSON for the question audit.");
+      return JSON.parse(value.slice(first,last+1));
+    };
+    console.log("Starting complete-paper pipeline",{model:MODEL,imageSize:req.file.size});
+    // Stage 1: inventory all printed labels and OR alternatives before answering.
+    const extractionPrompt = [
+      "Inspect the ENTIRE uploaded examination paper, including every column, page region, subquestion and OR alternative.",
+      "Return ONLY JSON: {\"questions\":[{\"label\":\"12(a)\",\"description\":\"short topic or readable question description\"}]}.",
+      "List every distinct subquestion in original reading order. Preserve printed labels exactly.",
+      "Include BOTH sides of every OR choice as separate entries. If both sides share a printed label, distinguish them by description.",
+      "Do not answer questions. Do not invent unreadable text. Include visible labels even when the question text is partly unreadable.",
+      "If no question can be identified, return {\"questions\":[]} ."
+    ].join("\n");
+    const extractionResult=await callGemini([{text:extractionPrompt},imagePart],2048);
+    const extracted=parseJson(extractionResult.text||"");
+    if(!Array.isArray(extracted.questions)||!extracted.questions.length) return res.status(422).json({success:false,error:"No readable question numbers were extracted. Upload a clearer, straight-on image.",stage:"extraction"});
+    const questions=extracted.questions.map((q,i)=>({
+      id:"Q"+(i+1), label:String(q?.label||"").trim(), description:String(q?.description||"").trim()
+    })).filter(q=>q.label);
+    if(!questions.length) return res.status(422).json({success:false,error:"Question extraction returned no usable question labels.",stage:"extraction"});
+    const inventory=questions.map(q=>q.id+" | "+q.label+" | "+q.description).join("\n");
+    // Stage 2: one combined, ordered answer-sheet generation.
+    const answerPrompt=[
+      DEFAULT_GEMINI_PROMPT,
+      "MANDATORY INVENTORY-FIRST RULES:",
+      "Answer EVERY inventory item below in this exact order. Include both OR alternatives and all subparts.",
+      "Use the exact printed label as each heading. Where a label repeats for OR alternatives, append a short distinguishing descriptor.",
+      "Do NOT reproduce the complete question statements. Give the answer only under each question label.",
+      "For numericals show Given, Required, formula, substitution, calculations, units and final result.",
+      "For derivations show assumptions, starting equation, intermediate steps and final expression.",
+      "Use LaTeX delimiters \( ... \) inline and \[ ... \] for display equations. Do not omit important steps to fit the OLED; firmware handles paging.",
+      "If the image is unclear, state this under that item; never guess.",
+      "End with a compact checklist using the inventory IDs Q1, Q2, etc. Mark ANSWERED or UNREADABLE only when justified. If truncated, state the last completed ID and next pending ID.",
+      "COMPLETE EXTRACTED INVENTORY (preserve order):\n"+inventory,
+      additionalPrompt?"OPTIONAL USER GUIDANCE (cannot override completeness, accuracy or order):\n"+additionalPrompt:""
+    ].filter(Boolean).join("\n\n");
+    const answerResult=await callGemini([{text:answerPrompt},imagePart]);
+    let answer=answerResult.text||"";
+    if(!answer.trim()) return res.status(502).json({success:false,error:"Gemini returned an empty answer sheet.",stage:"answer"});
+    const finishReason=answerResult.candidates?.[0]?.finishReason||null;
+    // Stage 3: independent audit against unique inventory IDs, not labels alone.
+    const auditPrompt=[
+      "Audit whether each inventory ID has a substantive answer in the answer sheet.",
+      "Return ONLY JSON: {\"answered\":[\"Q1\"],\"missing\":[\"Q2\"],\"unclear\":[\"Q3\"]}.",
+      "A checklist mention alone does not count as an answer. A substantive solution or explicit unreadable statement is required.",
+      "Treat OR alternatives as separate IDs. Never infer an answer from a neighbouring question.",
+      "INVENTORY:\n"+inventory,
+      "ANSWER SHEET:\n"+answer
+    ].join("\n\n");
+    const auditResult=await callGemini([{text:auditPrompt}],2048);
+    const audit=parseJson(auditResult.text||"");
+    const answered=Array.isArray(audit.answered)?audit.answered.map(String):[];
+    let missing=Array.isArray(audit.missing)?audit.missing.map(String):questions.map(q=>q.id);
+    const unclear=Array.isArray(audit.unclear)?audit.unclear.map(String):[];
+    // Stage 4: one repair pass for missing inventory IDs.
+    let repairAttempted=false;
+    if(missing.length){
+      repairAttempted=true;
+      const repairPrompt=[
+        "Answer ONLY these missing inventory IDs. Do not repeat existing answers.",
+        "Use the original uploaded paper. Preserve printed question labels and give complete exam-ready explanations, numerical steps and derivations.",
+        "If the image does not provide enough readable information, say so explicitly rather than guessing.",
+        "MISSING INVENTORY ITEMS:\n"+questions.filter(q=>missing.includes(q.id)).map(q=>q.id+" | "+q.label+" | "+q.description).join("\n"),
+        "EXISTING ANSWER SHEET FOR CONTEXT:\n"+answer
+      ].join("\n\n");
+      const repairResult=await callGemini([{text:repairPrompt},imagePart]);
+      const repairText=repairResult.text||"";
+      if(repairText.trim()) answer+="\n\n--- COMPLETION OF MISSING QUESTIONS ---\n\n"+repairText;
     }
-
-    const finishReason =
-      result.candidates?.[0]?.finishReason || null;
-
-    console.log("Gemini scan completed:", {
-      model: MODEL,
-      answerCharacters: answer.length,
-      finishReason
-    });
-
-    return res.json({
-      success: true,
-      answer,
-      model: MODEL,
-      finishReason
-    });
-
-  } catch (error) {
-    const status = Number(
-      error?.status ||
-      error?.statusCode ||
-      error?.code ||
-      0
-    );
-
-    console.error(
-      "Gemini processing error:",
-      status,
-      error?.message || error
-    );
-
-    if (status === 429) {
-      return res.status(429).json({
-        success: false,
-        error: "Gemini quota or rate limit reached. Wait and retry."
-      });
-    }
-
-    if (status === 503 || status === 502) {
-      return res.status(503).json({
-        success: false,
-        error: "Gemini is temporarily unavailable. Please retry."
-      });
-    }
-
-    if (status === 401 || status === 403) {
-      return res.status(status).json({
-        success: false,
-        error: "Gemini authentication error. Check Render environment variables."
-      });
-    }
-
-    return res.status(502).json({
-      success: false,
-      error: "AI processing failed. Check Render logs."
-    });
+    const completenessVerified=missing.length===0 && unclear.length===0 && finishReason!=="MAX_TOKENS";
+    console.log("Paper pipeline finished",{items:questions.length,missing:missing.length,unclear:unclear.length,characters:answer.length,finishReason,completenessVerified});
+    return res.json({success:true,answer,model:MODEL,finishReason,questionCount:questions.length,questionNumbers:questions.map(q=>q.label),questionInventory:questions,answeredQuestions:answered,missingQuestions:missing,unclearQuestions:unclear,completenessVerified,auditPerformed:true,repairAttempted});
+  } catch(error) {
+    const status=Number(error?.status||error?.statusCode||error?.code||0);
+    console.error("Gemini processing error:",status,error?.message||error);
+    if(status===429) return res.status(429).json({success:false,error:"Gemini quota or rate limit reached. Wait and retry."});
+    if(status===503||status===502) return res.status(503).json({success:false,error:"Gemini is temporarily unavailable. Please retry."});
+    if(status===401||status===403) return res.status(status).json({success:false,error:"Gemini authentication error. Check Render environment variables."});
+    return res.status(502).json({success:false,error:"AI processing failed: "+(error?.message||"Check Render logs.")});
   }
 }
 
