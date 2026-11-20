@@ -1,0 +1,22 @@
+name: Backend validation
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'esp32-gemini-assistant-integrated/**'
+      - '.github/workflows/backend-check.yml'
+  pull_request:
+    branches: [main]
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: esp32-gemini-assistant-integrated
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --ignore-scripts
+      - run: npm run check
