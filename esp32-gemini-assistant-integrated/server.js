@@ -455,36 +455,47 @@ async function processImage(req, res) {
         const target=aiTargets[targetIndex];
         const remaining=processingDeadline-Date.now();
         if(remaining<5000) break;
-        const requestTimeout=Math.min(85000,remaining-3000);
+        const requestTimeout=Math.min(70000,remaining-3000);
         try {
+          let timeoutId;
           const request=target.ai.models.generateContent({
             model:target.model,
             contents:[{ role:"user", parts }],
             config:{ maxOutputTokens:tokenLimit, temperature:0.2 }
           });
-          const timeout=new Promise((_,reject)=>setTimeout(()=>{
-            const error=new Error("Gemini request timed out after "+Math.round(requestTimeout/1000)+" seconds.");
-            error.status=504;
-            reject(error);
-          },requestTimeout));
-          const result=await Promise.race([request,timeout]);
-          if(targetIndex>0) console.warn("Gemini fallback target used:",target.label,target.model);
+          const timeout=new Promise((_,reject)=>{
+            timeoutId=setTimeout(()=>{
+              const error=new Error("Gemini request timed out after "+Math.round(requestTimeout/1000)+" seconds.");
+              error.status=504;
+              reject(error);
+            },requestTimeout);
+          });
+          let result;
+          try { result=await Promise.race([request,timeout]); }
+          finally { clearTimeout(timeoutId); }
+          console.log("Gemini target succeeded:",{target:target.label,model:target.model});
           return result;
         } catch(error) {
           lastError=error;
           const rawStatus=error?.status||error?.statusCode||error?.code||0;
-          const status=Number(rawStatus)||({RESOURCE_EXHAUSTED:429,UNAVAILABLE:503,DEADLINE_EXCEEDED:504,INTERNAL:500,PERMISSION_DENIED:403,UNAUTHENTICATED:401}[String(rawStatus).toUpperCase()]||0);
-          console.error("Gemini target failed:",{target:target.label,model:target.model,status,message:error?.message});
-          const canFailover=status===429||status===500||status===502||status===503||status===504;
+          const status=Number(rawStatus)||({RESOURCE_EXHAUSTED:429,UNAVAILABLE:503,DEADLINE_EXCEEDED:504,INTERNAL:500,PERMISSION_DENIED:403,UNAUTHENTICATED:401,NOT_FOUND:404,INVALID_ARGUMENT:400}[String(rawStatus).toUpperCase()]||0);
+          const message=String(error?.message||"");
+          const modelRejected=status===404||status===400||/model.+(not found|not supported|invalid)|not found.+model/i.test(message);
+          const canFailover=modelRejected||status===429||status===500||status===502||status===503||status===504;
+          console.error("Gemini target failed:",{target:target.label,model:target.model,status,message});
           if(!canFailover) break;
+          if(status===429||status===500||status===502||status===503||status===504) {
+            const pause=Math.min(2500,500*(targetIndex+1));
+            if(Date.now()+pause<processingDeadline) await new Promise(resolve=>setTimeout(resolve,pause));
+          }
         }
       }
       if(Date.now()>=processingDeadline) {
-        const timeoutError=new Error("The paper-processing time limit was reached. Try a clearer/cropped image or retry when Gemini is responsive.");
+        const timeoutError=new Error("The paper-processing time limit was reached after trying the configured Gemini models.");
         timeoutError.status=504;
         throw timeoutError;
       }
-      throw lastError || Object.assign(new Error("Gemini processing time limit reached before a response was received."),{status:504});
+      throw lastError || Object.assign(new Error("No configured Gemini model returned a response."),{status:503});
     };
     const parseJson = (raw) => {
       const value=String(raw||"").replace(/^```(?:json)?\s*/i,"").replace(/\s*```$/ ,"").trim();
@@ -628,7 +639,14 @@ async function processImage(req, res) {
           : "Gemini is rate-limiting requests. Automatic backoff was attempted; please wait briefly before retrying."
       });
     }
-    if(status===503||status===502) return res.status(503).json({success:false,error:"Gemini is temporarily unavailable. Please retry."});
+    if(status===503||status===502) {
+      const detail=String(error?.message||"No additional details").replace(/AIza[0-9A-Za-z_-]{20,}/g,"[redacted API key]").slice(0,500);
+      return res.status(503).json({success:false,code:"GEMINI_UPSTREAM_UNAVAILABLE",error:"Gemini could not complete the request after trying the configured models.",diagnostic:detail});
+    }
+    if(status===504) {
+      const detail=String(error?.message||"Request timed out").replace(/AIza[0-9A-Za-z_-]{20,}/g,"[redacted API key]").slice(0,500);
+      return res.status(504).json({success:false,code:"GEMINI_TIMEOUT",error:"Gemini did not respond within the processing time limit.",diagnostic:detail});
+    }
     if(status===401||status===403) return res.status(status).json({success:false,error:"Gemini authentication error. Check Render environment variables."});
     return res.status(502).json({success:false,error:"AI processing failed: "+(error?.message||"Check Render logs.")});
   }
