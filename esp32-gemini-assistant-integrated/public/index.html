@@ -42,8 +42,8 @@ label{display:block;margin:12px 0 6px;font-weight:600}
 <img id="preview" alt="Selected question paper preview">
 <p class="note" style="color:#79e6a2">Ready to scan · no device token required.</p>
 <p class="note">Your Gemini API key and ESP32 DEVICE_TOKEN remain on Render. This browser uses the same-origin route; no device token is needed.</p>
-<label for="prompt">Instruction to Gemini</label>
-<textarea id="prompt" style="min-height:105px">Read the uploaded study question paper carefully. Identify every visible question and provide accurate, detailed educational answers. Include relevant formulas, derivations and calculation steps. Do not invent unreadable text. MATHEMATICAL FORMATTING IS IMPORTANT: Use standard LaTeX math notation for every equation and symbol, enclosed in \( ... \) inline or $$ ... $$ for displayed equations. Write Greek letters using LaTeX commands such as \\alpha, \\beta, \\lambda, \\psi, \\theta, \\pi, \\Delta. Use proper LaTeX for fractions (\\frac{a}{b}), integrals (\\int), sums (\\sum), vectors (\\vec{E}), subscripts (\\beta_{phase}) and superscripts. Never spell a Greek symbol as an English word inside an equation (write \\beta_{phase}, not beta_phase). Keep explanatory prose readable. Do not omit derivation steps.</textarea>
+<label for="prompt">Optional extra guidance (cannot override question order or completeness)</label>
+<textarea id="prompt" style="min-height:80px" placeholder="Optional: e.g. focus on 8-mark answers. Leave blank to use the standard instructions."></textarea>
 <div class="row">
 <button class="primary" id="scan">SCAN WITH GEMINI</button>
 <button id="clear">Clear image</button>
@@ -260,7 +260,7 @@ document.getElementById('scan').onclick=async()=>{
  message.textContent='Uploading image to Render. The first request may take a little longer if the free service is waking up...';
  try{
   const form=new FormData();form.append('image',file,file.name);
-  form.append('prompt',document.getElementById('prompt').value);
+  const extra=document.getElementById('prompt').value.trim();if(extra)form.append('prompt',extra);
   const response=await fetch(API_URL,{method:'POST',body:form});
   const raw=await response.text();let data;
   try{data=JSON.parse(raw)}catch{throw new Error('Server returned a non-JSON response: '+raw.slice(0,350))}
@@ -270,7 +270,7 @@ document.getElementById('scan').onclick=async()=>{
   if(typeof answer!=='string'||!answer.trim()){
    throw new Error('The server responded, but the answer field was not found. Response: '+JSON.stringify(data).slice(0,700));
   }
-  input.value=answer;stop();load();message.textContent='Success! Gemini answer received and loaded onto the virtual OLED.';
+  input.value=answer;stop();load();const labels=Array.isArray(data.questionNumbers)?data.questionNumbers:[];const missing=Array.isArray(data.missingQuestions)?data.missingQuestions:[];const unclear=Array.isArray(data.unclearQuestions)?data.unclearQuestions:[];const status=data.completenessVerified?'AUDIT: all extracted labels accounted for.':'AUDIT WARNING: check missing/unreadable labels below.';message.textContent='Answer received. Extracted '+(data.questionCount||labels.length)+' question items. '+status+'\nLabels: '+labels.join(', ')+'\nMissing: '+(missing.join(', ')||'none reported')+'\nUnclear: '+(unclear.join(', ')||'none reported')+'\nReview the answer sheet before relying on it.';
   document.querySelector('.screen').scrollIntoView({behavior:'smooth',block:'center'});
  }catch(err){
   message.textContent='Scan failed: '+err.message+'\n\nCheck your internet connection and Render deployment. The simulator and API are served from the same website.';
