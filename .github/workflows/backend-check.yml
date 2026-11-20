@@ -22,4 +22,4 @@ jobs:
       - run: npm run check
       - name: Check inline browser simulator JavaScript
         run: |
-          node --input-type=commonjs -e 'const fs=require("node:fs"); const vm=require("node:vm"); const html=fs.readFileSync("public/index.html","utf8"); const scripts=[...html.matchAll(/<script(?:\\s[^>]*)?>([\\s\\S]*?)<\\/script>/gi)].map(m=>m[1]).filter(s=>s.trim()); if(!scripts.length) throw new Error("No inline scripts found"); scripts.forEach((source,index)=>new vm.Script(source,{filename:"public/index.html:inline-script-"+index})); console.log("Validated "+scripts.length+" inline browser script(s).");'
+          node --input-type=commonjs -e 'const fs=require("node:fs"); const vm=require("node:vm"); const html=fs.readFileSync("public/index.html","utf8"); const scripts=[...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)].map(m=>m[1]).filter(s=>s.trim()); if(!scripts.length) throw new Error("No inline scripts found"); scripts.forEach((source,index)=>new vm.Script(source,{filename:"public/index.html:inline-script-"+index})); console.log("Validated "+scripts.length+" inline browser script(s).");'
