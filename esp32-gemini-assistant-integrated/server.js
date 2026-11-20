@@ -447,35 +447,44 @@ async function processImage(req, res) {
     const imagePart = { inlineData:{ mimeType:detectedType, data:req.file.buffer.toString("base64") } };
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     const isQuotaExhausted = error => /per.?day|daily.?quota|quota.?exceeded|limit:\s*0/i.test(String(error?.message||""));
+    // Hard processing budget: never leave a browser request waiting indefinitely.
+    const processingDeadline = Date.now() + 220000;
     const callGemini = async (parts, tokenLimit=MAX_OUTPUT_TOKENS) => {
       let lastError;
       for (let targetIndex=0; targetIndex<aiTargets.length; targetIndex++) {
         const target=aiTargets[targetIndex];
-        for (let attempt=0; attempt<3; attempt++) {
-          try {
-            const result=await target.ai.models.generateContent({
-              model:target.model,
-              contents:[{ role:"user", parts }],
-              config:{ maxOutputTokens:tokenLimit, temperature:0.2 }
-            });
-            if(targetIndex>0) console.warn("Gemini fallback target used:",target.label,target.model);
-            return result;
-          } catch(error) {
-            lastError=error;
-            const rawStatus=error?.status||error?.statusCode||error?.code||0;
-            const status=Number(rawStatus)||({RESOURCE_EXHAUSTED:429,UNAVAILABLE:503,DEADLINE_EXCEEDED:504,INTERNAL:500,PERMISSION_DENIED:403,UNAUTHENTICATED:401}[String(rawStatus).toUpperCase()]||0);
-            const retryable=status===429||status===500||status===502||status===503||status===504;
-            if (status===429 && isQuotaExhausted(error)) break;
-            if (!retryable || attempt===2) break;
-            // Bounded exponential backoff with jitter; never spin on exhausted daily quota.
-            await sleep(Math.min(8000,1000*(2**attempt))+Math.floor(Math.random()*300));
-          }
+        const remaining=processingDeadline-Date.now();
+        if(remaining<5000) break;
+        const requestTimeout=Math.min(85000,remaining-3000);
+        try {
+          const request=target.ai.models.generateContent({
+            model:target.model,
+            contents:[{ role:"user", parts }],
+            config:{ maxOutputTokens:tokenLimit, temperature:0.2 }
+          });
+          const timeout=new Promise((_,reject)=>setTimeout(()=>{
+            const error=new Error("Gemini request timed out after "+Math.round(requestTimeout/1000)+" seconds.");
+            error.status=504;
+            reject(error);
+          },requestTimeout));
+          const result=await Promise.race([request,timeout]);
+          if(targetIndex>0) console.warn("Gemini fallback target used:",target.label,target.model);
+          return result;
+        } catch(error) {
+          lastError=error;
+          const rawStatus=error?.status||error?.statusCode||error?.code||0;
+          const status=Number(rawStatus)||({RESOURCE_EXHAUSTED:429,UNAVAILABLE:503,DEADLINE_EXCEEDED:504,INTERNAL:500,PERMISSION_DENIED:403,UNAUTHENTICATED:401}[String(rawStatus).toUpperCase()]||0);
+          console.error("Gemini target failed:",{target:target.label,model:target.model,status,message:error?.message});
+          const canFailover=status===429||status===500||status===502||status===503||status===504;
+          if(!canFailover) break;
         }
-        const rawStatus=lastError?.status||lastError?.statusCode||lastError?.code||0;
-        const status=Number(rawStatus)||({RESOURCE_EXHAUSTED:429,UNAVAILABLE:503,DEADLINE_EXCEEDED:504,INTERNAL:500}[String(rawStatus).toUpperCase()]||0);
-        if (!(status===429||status===500||status===502||status===503||status===504)) break;
       }
-      throw lastError || new Error("All configured Gemini targets failed.");
+      if(Date.now()>=processingDeadline) {
+        const timeoutError=new Error("The paper-processing time limit was reached. Try a clearer/cropped image or retry when Gemini is responsive.");
+        timeoutError.status=504;
+        throw timeoutError;
+      }
+      throw lastError || Object.assign(new Error("Gemini processing time limit reached before a response was received."),{status:504});
     };
     const parseJson = (raw) => {
       const value=String(raw||"").replace(/^```(?:json)?\s*/i,"").replace(/\s*```$/ ,"").trim();
@@ -483,7 +492,7 @@ async function processImage(req, res) {
       if(first<0||last<=first) throw new Error("Gemini did not return valid JSON for the question audit.");
       return JSON.parse(value.slice(first,last+1));
     };
-    console.log("Starting complete-paper pipeline",{model:MODEL,imageSize:req.file.size});
+    console.log("Starting complete-paper pipeline",{model:MODEL,imageSize:req.file.size,deadlineSeconds:220});
     // Stage 1: inventory all printed labels and OR alternatives before answering.
     const extractionPrompt = [
       "Inspect the ENTIRE uploaded examination paper, including every column, page region, subquestion and OR alternative.",
@@ -493,6 +502,7 @@ async function processImage(req, res) {
       "Do not answer questions. Do not invent unreadable text. Include visible labels even when the question text is partly unreadable.",
       "If no question can be identified, return {\"questions\":[]} ."
     ].join("\n");
+    console.log("Paper stage: question extraction");
     const extractionResult=await callGemini([{text:extractionPrompt},imagePart],2048);
     const extracted=parseJson(extractionResult.text||"");
     if(!Array.isArray(extracted.questions)||!extracted.questions.length) return res.status(422).json({success:false,error:"No readable question numbers were extracted. Upload a clearer, straight-on image.",stage:"extraction"});
@@ -516,6 +526,7 @@ async function processImage(req, res) {
       "COMPLETE EXTRACTED INVENTORY (preserve order):\n"+inventory,
       additionalPrompt?"OPTIONAL USER GUIDANCE (cannot override completeness, accuracy or order):\n"+additionalPrompt:""
     ].filter(Boolean).join("\n\n");
+    console.log("Paper stage: full answer generation",{questionCount:questions.length});
     const answerResult=await callGemini([{text:answerPrompt},imagePart]);
     let answer=answerResult.text||"";
     if(!answer.trim()) return res.status(502).json({success:false,error:"Gemini returned an empty answer sheet.",stage:"answer"});
@@ -553,6 +564,7 @@ async function processImage(req, res) {
         "INVENTORY:\n"+inventory,
         "ANSWER SHEET:\n"+answer
       ].join("\n\n");
+      console.log("Paper stage: completeness audit");
       const audit=parseJson((await callGemini([{text:auditPrompt}],2048)).text||"");
       answered=Array.isArray(audit.answered)?audit.answered.map(String):[];
       unclear=Array.isArray(audit.unclear)?audit.unclear.map(String):[];
@@ -577,6 +589,7 @@ async function processImage(req, res) {
           "MISSING INVENTORY ITEMS:\n"+questions.filter(q=>missing.includes(q.id)).map(q=>q.id+" | "+q.label+" | "+q.description).join("\n"),
           "EXISTING ANSWER SHEET FOR CONTEXT:\n"+answer
         ].join("\n\n");
+        console.log("Paper stage: repairing missing questions",{missing:missing.length});
         const repairResult=await callGemini([{text:repairPrompt},imagePart]);
         const repairText=repairResult.text||"";
         if(repairText.trim()) answer+="\n\n--- COMPLETION OF MISSING QUESTIONS ---\n\n"+repairText;
