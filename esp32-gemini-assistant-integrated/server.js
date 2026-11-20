@@ -22,6 +22,8 @@ const MAX_PROMPT_LENGTH = 16000;
 
 const MODEL =
   process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const ALTERNATE_MODEL =
+  process.env.GEMINI_ALTERNATE_MODEL || "gemini-3.5-flash-lite";
 
 const MAX_OUTPUT_TOKENS = Number(
   process.env.MAX_OUTPUT_TOKENS || 8192
@@ -403,7 +405,7 @@ app.get("/health", (req, res) => {
     service: "ESP32 Gemini Study Assistant",
     model: MODEL,
     fallbackConfigured: Boolean(process.env.GEMINI_API_KEY_FALLBACK),
-    alternateModelConfigured: Boolean(process.env.GEMINI_ALTERNATE_MODEL),
+    alternateModelConfigured: Boolean(ALTERNATE_MODEL),\n    alternateModel: ALTERNATE_MODEL,
     permanentPrompt: true,
     multipartPartsLimit: "unrestricted",
     browserRoute: "/api/browser-solve",
@@ -430,15 +432,15 @@ async function processImage(req, res) {
     aiTargets.push({ ai:primaryAI, model:MODEL, label:"primary" });
     // A model-specific quota can be exhausted while another model on the
     // same project remains available. Configure this independently if desired.
-    if (process.env.GEMINI_ALTERNATE_MODEL && process.env.GEMINI_ALTERNATE_MODEL !== MODEL) {
-      aiTargets.push({ ai:primaryAI, model:process.env.GEMINI_ALTERNATE_MODEL, label:"same-project alternate model" });
+    if (ALTERNATE_MODEL && ALTERNATE_MODEL !== MODEL) {
+      aiTargets.push({ ai:primaryAI, model:ALTERNATE_MODEL, label:"same-project alternate model" });
     }
     if (process.env.GEMINI_API_KEY_FALLBACK) {
       const fallbackAI = new GoogleGenAI({ apiKey:process.env.GEMINI_API_KEY_FALLBACK });
       const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || MODEL;
       aiTargets.push({ ai:fallbackAI, model:fallbackModel, label:"separate-project fallback" });
-      if (process.env.GEMINI_ALTERNATE_MODEL && process.env.GEMINI_ALTERNATE_MODEL !== fallbackModel) {
-        aiTargets.push({ ai:fallbackAI, model:process.env.GEMINI_ALTERNATE_MODEL, label:"fallback alternate model" });
+      if (ALTERNATE_MODEL && ALTERNATE_MODEL !== fallbackModel) {
+        aiTargets.push({ ai:fallbackAI, model:ALTERNATE_MODEL, label:"fallback alternate model" });
       }
     }
     const imagePart = { inlineData:{ mimeType:detectedType, data:req.file.buffer.toString("base64") } };
@@ -459,7 +461,8 @@ async function processImage(req, res) {
             return result;
           } catch(error) {
             lastError=error;
-            const status=Number(error?.status||error?.statusCode||error?.code||0);
+            const rawStatus=error?.status||error?.statusCode||error?.code||0;
+            const status=Number(rawStatus)||({RESOURCE_EXHAUSTED:429,UNAVAILABLE:503,DEADLINE_EXCEEDED:504,INTERNAL:500,PERMISSION_DENIED:403,UNAUTHENTICATED:401}[String(rawStatus).toUpperCase()]||0);
             const retryable=status===429||status===500||status===502||status===503||status===504;
             if (status===429 && isQuotaExhausted(error)) break;
             if (!retryable || attempt===2) break;
@@ -467,7 +470,8 @@ async function processImage(req, res) {
             await sleep(Math.min(8000,1000*(2**attempt))+Math.floor(Math.random()*300));
           }
         }
-        const status=Number(lastError?.status||lastError?.statusCode||lastError?.code||0);
+        const rawStatus=lastError?.status||lastError?.statusCode||lastError?.code||0;
+        const status=Number(rawStatus)||({RESOURCE_EXHAUSTED:429,UNAVAILABLE:503,DEADLINE_EXCEEDED:504,INTERNAL:500}[String(rawStatus).toUpperCase()]||0);
         if (!(status===429||status===500||status===502||status===503||status===504)) break;
       }
       throw lastError || new Error("All configured Gemini targets failed.");
@@ -597,8 +601,9 @@ async function processImage(req, res) {
     console.log("Paper pipeline finished",{items:questions.length,missing:missing.length,unclear:unclear.length,characters:answer.length,finishReason,completenessVerified});
     return res.json({success:true,answer,model:MODEL,finishReason,questionCount:questions.length,questionNumbers:questions.map(q=>q.label),questionInventory:questions,answeredQuestions:answered,missingQuestions:missing,unclearQuestions:unclear,completenessVerified,auditPerformed,auditWarning,repairAttempted});
   } catch(error) {
-    const status=Number(error?.status||error?.statusCode||error?.code||0);
-    console.error("Gemini processing error:",status,error?.message||error);
+    const rawStatus=error?.status||error?.statusCode||error?.code||0;
+    const status=Number(rawStatus)||({RESOURCE_EXHAUSTED:429,UNAVAILABLE:503,DEADLINE_EXCEEDED:504,INTERNAL:500,PERMISSION_DENIED:403,UNAUTHENTICATED:401}[String(rawStatus).toUpperCase()]||0);
+    console.error("Gemini processing error:",{status,rawStatus,message:error?.message,details:error?.details,stack:error?.stack});
     if(status===429) {
       const quotaExhausted = /per.?day|daily.?quota|quota.?exceeded|limit:\s*0/i.test(String(error?.message||""));
       return res.status(429).json({
