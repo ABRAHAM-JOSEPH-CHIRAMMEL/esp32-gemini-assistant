@@ -468,7 +468,24 @@ async function processImage(req, res) {
     const answerResult=await callGemini([{text:answerPrompt},imagePart]);
     let answer=answerResult.text||"";
     if(!answer.trim()) return res.status(502).json({success:false,error:"Gemini returned an empty answer sheet.",stage:"answer"});
-    const finishReason=answerResult.candidates?.[0]?.finishReason||null;
+    let finishReason=answerResult.candidates?.[0]?.finishReason||null;
+    // Continue a token-limited answer without repeating already completed sections.
+    let continuationCount=0;
+    while(finishReason==="MAX_TOKENS" && continuationCount<2){
+      continuationCount++;
+      const continuationPrompt=[
+        "Continue the SAME combined answer sheet from exactly where the previous output stopped.",
+        "Do not repeat any completed answer. Continue in the original inventory order and include every remaining item.",
+        "If the previous output ended mid-answer, finish that answer first. Keep the exact printed labels and full numerical/derivation steps.",
+        "INVENTORY:\\n"+inventory,
+        "PREVIOUS ANSWER ENDING (context):\\n"+answer.slice(-14000)
+      ].join("\\n\\n");
+      const continuation=await callGemini([{text:continuationPrompt},imagePart]);
+      const nextText=continuation.text||"";
+      if(nextText.trim()) answer+="\\n\\n"+nextText;
+      finishReason=continuation.candidates?.[0]?.finishReason||null;
+      if(!nextText.trim()) break;
+    }
     // Stage 3: independent audit against unique inventory IDs, not labels alone.
     const auditPrompt=[
       "Audit whether each inventory ID has a substantive answer in the answer sheet.",
