@@ -499,7 +499,7 @@ async function processImage(req, res) {
       if(repairText.trim()) answer+="\n\n--- COMPLETION OF MISSING QUESTIONS ---\n\n"+repairText;
       // Re-audit the repaired combined answer; repair attempt alone is not proof.
       const finalAuditPrompt=[
-        "Re-audit the combined answer after repair. Return ONLY JSON: {\\"answered\\":[\\"Q1\\"],\\"missing\\":[\\"Q2\\"],\\"unclear\\":[\\"Q3\\"]}.",
+        "Re-audit the combined answer after repair. Return ONLY JSON: {\"answered\":[\"Q1\"],\"missing\":[\"Q2\"],\"unclear\":[\"Q3\"]}.",
         "Only count a substantive answer or an explicit unreadable statement. Checklist mentions alone do not count.",
         "INVENTORY:\\n"+inventory,
         "COMBINED ANSWER:\\n"+answer
