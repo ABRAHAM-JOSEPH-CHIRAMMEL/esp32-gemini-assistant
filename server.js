@@ -1,97 +1,342 @@
-PATCH server.js — REQUIRED BEFORE USING THE NO-TOKEN SIMULATOR
 
-Important:
-- Keep the existing /api/solve endpoint and DEVICE_TOKEN authentication for the ESP32.
-- This adds /api/browser-solve for the local browser simulator.
-- The browser route does not ask for DEVICE_TOKEN. It is publicly reachable, so it is limited to 3 scans per IP per 5 minutes, plus the existing 5 MB image limit.
-- This is not user-account authentication. Anyone who discovers the endpoint may attempt to use it within the rate limit. Monitor Gemini usage in Google AI Studio.
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import crypto from "node:crypto";
+import { GoogleGenAI } from "@google/genai";
+import { fileTypeFromBuffer } from "file-type";
+import { rateLimit } from "express-rate-limit";
 
-CHANGE 1 — trust the Render proxy
-Find:
-  app.disable("x-powered-by");
+const app = express();
 
-Replace with:
-  app.disable("x-powered-by");
-  app.set("trust proxy", 1);
+// --------------------------------------------------
+// CONFIGURATION
+// --------------------------------------------------
 
-CHANGE 2 — allow a local HTML file origin
-Find this CORS condition:
-    if (!origin || allowedOrigins.length === 0 ||
-        allowedOrigins.includes(origin)) {
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
 
-Replace with:
-    if (!origin || origin === "null" || allowedOrigins.length === 0 ||
-        allowedOrigins.includes(origin)) {
+const PORT = process.env.PORT || 10000;
 
-CHANGE 3 — add this browser rate limiter
-Insert this block after the existing rateLimit(req, res, next) function and before the IMAGE UPLOAD section:
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const DEVICE_TOKEN = process.env.DEVICE_TOKEN;
 
-// Public browser route: strict per-IP limit because it does not ask for a token.
-const browserRequestCounts = new Map();
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
-function browserRateLimit(req, res, next) {
-  const now = Date.now();
-  const windowMs = 5 * 60 * 1000;
-  const maxRequests = 3;
-  const ip = req.ip || "unknown";
-  let record = browserRequestCounts.get(ip);
+const MAX_OUTPUT_TOKENS = Number(
+  process.env.MAX_OUTPUT_TOKENS || 60000
+);
 
-  if (!record || now - record.start >= windowMs) {
-    record = { start: now, count: 0 };
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+// --------------------------------------------------
+// CORS
+// --------------------------------------------------
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Local HTML files send the origin "null".
+      if (
+        !origin ||
+        origin === "null" ||
+        allowedOrigins.length === 0 ||
+        allowedOrigins.includes(origin)
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Origin not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "x-device-token"
+    ]
+  })
+);
+
+// --------------------------------------------------
+// GEMINI INITIALIZATION
+// --------------------------------------------------
+
+const genAI = GEMINI_API_KEY
+  ? new GoogleGenAI({ apiKey: GEMINI_API_KEY })
+  : null;
+
+// --------------------------------------------------
+// IMAGE UPLOAD CONFIGURATION
+// --------------------------------------------------
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_FILE_SIZE,
+    files: 1
+  }
+});
+
+// --------------------------------------------------
+// RATE LIMITING
+// --------------------------------------------------
+
+// ESP32 endpoint: maximum 10 requests per minute.
+const deviceRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    error: "Too many requests. Please wait before trying again."
+  }
+});
+
+// Browser simulator: maximum 3 scans per IP every 5 minutes.
+const browserRateLimit = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  limit: 3,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    error: "Browser scan limit reached. Please wait five minutes."
+  }
+});
+
+// --------------------------------------------------
+// DEVICE AUTHENTICATION
+// --------------------------------------------------
+
+function authenticateDevice(req, res, next) {
+  if (!DEVICE_TOKEN) {
+    return res.status(503).json({
+      success: false,
+      error: "DEVICE_TOKEN is not configured on Render."
+    });
   }
 
-  record.count++;
-  browserRequestCounts.set(ip, record);
+  const suppliedToken = req.get("x-device-token") || "";
 
-  if (record.count > maxRequests) {
-    return res.status(429).json({
-      error: "Browser scan limit reached. Please wait five minutes before trying again."
+  const suppliedBuffer = Buffer.from(suppliedToken);
+  const correctBuffer = Buffer.from(DEVICE_TOKEN);
+
+  const valid =
+    suppliedBuffer.length === correctBuffer.length &&
+    crypto.timingSafeEqual(suppliedBuffer, correctBuffer);
+
+  if (!valid) {
+    return res.status(401).json({
+      success: false,
+      error: "Invalid device token."
     });
   }
 
   next();
 }
 
-CHANGE 4 — change the existing /api/solve route middleware
-Find the beginning of the existing route:
-  app.post(
-    "/api/solve",
-    rateLimit,
-    authenticateDevice,
-    upload.single("image"),
+// --------------------------------------------------
+// SHARED GEMINI IMAGE PROCESSING
+// --------------------------------------------------
 
-Replace only those lines with:
-  app.post(
-    ["/api/solve", "/api/browser-solve"],
-    (req, res, next) => {
-      if (req.path === "/api/browser-solve") {
-        return browserRateLimit(req, res, () => {
-          if (!process.env.DEVICE_TOKEN) {
-            return res.status(503).json({
-              error: "Server DEVICE_TOKEN is not configured."
-            });
-          }
+async function solveImage(req, res) {
+  try {
+    if (!genAI) {
+      return res.status(503).json({
+        success: false,
+        error: "GEMINI_API_KEY is not configured on Render."
+      });
+    }
 
-          // The secret stays on Render; it is never sent to the browser.
-          req.headers["x-device-token"] = process.env.DEVICE_TOKEN;
-          next();
-        });
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: "No image uploaded. Use the image field."
+      });
+    }
+
+    // Verify the actual image signature.
+    const detectedType = await fileTypeFromBuffer(
+      req.file.buffer
+    );
+
+    const allowedTypes = [
+      "image/jpeg",
+      "image/png",
+      "image/webp"
+    ];
+
+    if (
+      !detectedType ||
+      !allowedTypes.includes(detectedType.mime)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Unsupported or invalid image. Use JPG, PNG or WebP."
+      });
+    }
+
+    const prompt =
+      typeof req.body?.prompt === "string" &&
+      req.body.prompt.trim()
+        ? req.body.prompt.trim()
+        : `Read the uploaded study question paper carefully.
+Identify every visible question and provide accurate,
+detailed educational answers. Include relevant formulas,
+derivations and calculation steps. Do not invent unreadable text.`;
+
+    const imageBase64 = req.file.buffer.toString("base64");
+
+    const result = await genAI.models.generateContent({
+      model: GEMINI_MODEL,
+
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: prompt
+            },
+            {
+              inlineData: {
+                mimeType: detectedType.mime,
+                data: imageBase64
+              }
+            }
+          ]
+        }
+      ],
+
+      config: {
+        temperature: 0.2,
+        maxOutputTokens: MAX_OUTPUT_TOKENS
       }
+    });
 
-      return rateLimit(req, res, next);
-    },
-    authenticateDevice,
-    upload.single("image"),
+    const answer = result.text || "";
 
-Do not change the rest of the route handler. It must continue into the existing async (req, res) => { ... } code.
+    if (!answer.trim()) {
+      return res.status(502).json({
+        success: false,
+        error: "Gemini returned an empty answer.",
+        finishReason:
+          result.candidates?.[0]?.finishReason || null
+      });
+    }
 
-After saving server.js:
-1. Commit/push the change to the GitHub main branch (or upload the revised server.js).
-2. Wait for Render to finish deploying.
-3. Open https://esp32-gemini-assistant.onrender.com/ and confirm it says status online.
-4. Open Gemini_OLED_Simulator_NoToken.html in Chrome.
-5. Select an image and click SCAN WITH GEMINI. No device token is entered in the simulator.
+    const finishReason =
+      result.candidates?.[0]?.finishReason || null;
 
-If you receive a CORS error, check that CHANGE 2 was deployed.
-If you receive 404 for /api/browser-solve, CHANGE 4 was not deployed.
-If you receive 429, wait five minutes before trying again.
+    return res.status(200).json({
+      success: true,
+      answer,
+      finishReason,
+      truncated: finishReason === "MAX_TOKENS",
+      model: GEMINI_MODEL
+    });
+
+  } catch (error) {
+    console.error("Gemini processing error:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Image processing failed."
+    });
+  }
+}
+
+// --------------------------------------------------
+// HEALTH CHECK
+// --------------------------------------------------
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "online",
+    service: "ESP32 Gemini Study Assistant"
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "online",
+    geminiConfigured: Boolean(GEMINI_API_KEY),
+    deviceAuthenticationConfigured: Boolean(DEVICE_TOKEN)
+  });
+});
+
+// --------------------------------------------------
+// ESP32 ENDPOINT - DEVICE TOKEN REQUIRED
+// --------------------------------------------------
+
+app.post(
+  "/api/solve",
+  deviceRateLimit,
+  authenticateDevice,
+  upload.single("image"),
+  solveImage
+);
+
+// --------------------------------------------------
+// BROWSER SIMULATOR ENDPOINT - NO TOKEN ENTRY
+// --------------------------------------------------
+
+app.post(
+  "/api/browser-solve",
+  browserRateLimit,
+  upload.single("image"),
+  solveImage
+);
+
+// --------------------------------------------------
+// ERROR HANDLING
+// --------------------------------------------------
+
+app.use((err, req, res, next) => {
+  console.error("Server error:", err.message);
+
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        success: false,
+        error: "Image exceeds the 5 MB upload limit."
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      error: err.message
+    });
+  }
+
+  if (err.message === "Origin not allowed by CORS") {
+    return res.status(403).json({
+      success: false,
+      error: "Browser origin is not allowed."
+    });
+  }
+
+  return res.status(500).json({
+    success: false,
+    error: "Internal server error."
+  });
+});
+
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("====================================");
+  console.log("ESP32 GEMINI STUDY ASSISTANT ONLINE");
+  console.log("Port:", PORT);
+  console.log("Gemini model:", GEMINI_MODEL);
+  console.log("Gemini configured:", Boolean(GEMINI_API_KEY));
+  console.log("Device token configured:", Boolean(DEVICE_TOKEN));
+  console.log("Browser endpoint: /api/browser-solve");
+  console.log("ESP32 endpoint: /api/solve");
+  console.log("====================================");
+});
