@@ -421,11 +421,49 @@ async function processImage(req, res) {
     if (!detectedType || detectedType !== req.file.mimetype) return res.status(415).json({ success:false, error:"Invalid or unsupported image file." });
     const additionalPrompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
     if (additionalPrompt.length > MAX_PROMPT_LENGTH) return res.status(400).json({ success:false, error:"Additional instruction is too long." });
-    const ai = new GoogleGenAI({ apiKey:process.env.GEMINI_API_KEY });
+    // Primary + optional independent fallback credentials/model.
+    // A second key should belong to a separately quota-managed Google AI project.
+    const aiTargets = [
+      { ai:new GoogleGenAI({ apiKey:process.env.GEMINI_API_KEY }), model:MODEL, label:"primary" }
+    ];
+    if (process.env.GEMINI_API_KEY_FALLBACK) {
+      aiTargets.push({
+        ai:new GoogleGenAI({ apiKey:process.env.GEMINI_API_KEY_FALLBACK }),
+        model:process.env.GEMINI_FALLBACK_MODEL || MODEL,
+        label:"fallback"
+      });
+    }
     const imagePart = { inlineData:{ mimeType:detectedType, data:req.file.buffer.toString("base64") } };
-    const callGemini = async (parts, tokenLimit=MAX_OUTPUT_TOKENS) => ai.models.generateContent({
-      model:MODEL, contents:[{ role:"user", parts }], config:{ maxOutputTokens:tokenLimit, temperature:0.2 }
-    });
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const isQuotaExhausted = error => /per.?day|daily.?quota|quota.?exceeded|limit:\s*0/i.test(String(error?.message||""));
+    const callGemini = async (parts, tokenLimit=MAX_OUTPUT_TOKENS) => {
+      let lastError;
+      for (let targetIndex=0; targetIndex<aiTargets.length; targetIndex++) {
+        const target=aiTargets[targetIndex];
+        for (let attempt=0; attempt<3; attempt++) {
+          try {
+            const result=await target.ai.models.generateContent({
+              model:target.model,
+              contents:[{ role:"user", parts }],
+              config:{ maxOutputTokens:tokenLimit, temperature:0.2 }
+            });
+            if(targetIndex>0) console.warn("Gemini fallback target used:",target.label,target.model);
+            return result;
+          } catch(error) {
+            lastError=error;
+            const status=Number(error?.status||error?.statusCode||error?.code||0);
+            const retryable=status===429||status===500||status===502||status===503||status===504;
+            if (status===429 && isQuotaExhausted(error)) break;
+            if (!retryable || attempt===2) break;
+            // Bounded exponential backoff with jitter; never spin on exhausted daily quota.
+            await sleep(Math.min(8000,1000*(2**attempt))+Math.floor(Math.random()*300));
+          }
+        }
+        const status=Number(lastError?.status||lastError?.statusCode||lastError?.code||0);
+        if (!(status===429||status===500||status===502||status===503||status===504)) break;
+      }
+      throw lastError || new Error("All configured Gemini targets failed.");
+    };
     const parseJson = (raw) => {
       const value=String(raw||"").replace(/^```(?:json)?\s*/i,"").replace(/\s*```$/ ,"").trim();
       const first=value.indexOf("{"), last=value.lastIndexOf("}");
@@ -530,7 +568,16 @@ async function processImage(req, res) {
   } catch(error) {
     const status=Number(error?.status||error?.statusCode||error?.code||0);
     console.error("Gemini processing error:",status,error?.message||error);
-    if(status===429) return res.status(429).json({success:false,error:"Gemini quota or rate limit reached. Wait and retry."});
+    if(status===429) {
+      const quotaExhausted = /per.?day|daily.?quota|quota.?exceeded|limit:\s*0/i.test(String(error?.message||""));
+      return res.status(429).json({
+        success:false,
+        code:quotaExhausted?"GEMINI_QUOTA_EXHAUSTED":"GEMINI_RATE_LIMITED",
+        error:quotaExhausted
+          ? "The configured Gemini API project has exhausted its quota. Automatic retries and any configured fallback were attempted. Add a fallback API key from a separate Google AI project or wait for the quota reset."
+          : "Gemini is rate-limiting requests. Automatic backoff was attempted; please wait briefly before retrying."
+      });
+    }
     if(status===503||status===502) return res.status(503).json({success:false,error:"Gemini is temporarily unavailable. Please retry."});
     if(status===401||status===403) return res.status(status).json({success:false,error:"Gemini authentication error. Check Render environment variables."});
     return res.status(502).json({success:false,error:"AI processing failed: "+(error?.message||"Check Render logs.")});
