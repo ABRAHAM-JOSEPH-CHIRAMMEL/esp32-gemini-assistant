@@ -402,6 +402,7 @@ app.get("/health", (req, res) => {
     status: "online",
     service: "ESP32 Gemini Study Assistant",
     model: MODEL,
+    fallbackConfigured: Boolean(process.env.GEMINI_API_KEY_FALLBACK),
     permanentPrompt: true,
     multipartPartsLimit: "unrestricted",
     browserRoute: "/api/browser-solve",
