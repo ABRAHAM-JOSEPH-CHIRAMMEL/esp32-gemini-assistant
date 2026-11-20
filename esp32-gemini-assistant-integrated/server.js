@@ -586,7 +586,8 @@ async function processImage(req, res) {
         console.warn("Repair/re-audit incomplete; preserving available answer:",repairError?.message||repairError);
       }
     }
-    const completenessVerified=auditPerformed && missing.length===0 && unclear.length===0 && finishReason!=="MAX_TOKENS";\n    const auditWarning=auditPerformed?null:"Answer generated, but the separate completeness audit was unavailable. Review all extracted question labels manually.";
+    const completenessVerified=auditPerformed && missing.length===0 && unclear.length===0 && finishReason!=="MAX_TOKENS";
+    const auditWarning=auditPerformed?null:"Answer generated, but the separate completeness audit was unavailable. Review all extracted question labels manually.";
     console.log("Paper pipeline finished",{items:questions.length,missing:missing.length,unclear:unclear.length,characters:answer.length,finishReason,completenessVerified});
     return res.json({success:true,answer,model:MODEL,finishReason,questionCount:questions.length,questionNumbers:questions.map(q=>q.label),questionInventory:questions,answeredQuestions:answered,missingQuestions:missing,unclearQuestions:unclear,completenessVerified,auditPerformed,auditWarning,repairAttempted});
   } catch(error) {
