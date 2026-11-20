@@ -479,10 +479,10 @@ async function processImage(req, res) {
         "If the previous output ended mid-answer, finish that answer first. Keep the exact printed labels and full numerical/derivation steps.",
         "INVENTORY:\\n"+inventory,
         "PREVIOUS ANSWER ENDING (context):\\n"+answer.slice(-14000)
-      ].join("\\n\\n");
+      ].join("\n\n");
       const continuation=await callGemini([{text:continuationPrompt},imagePart]);
       const nextText=continuation.text||"";
-      if(nextText.trim()) answer+="\\n\\n"+nextText;
+      if(nextText.trim()) answer+="\n\n"+nextText;
       finishReason=continuation.candidates?.[0]?.finishReason||null;
       if(!nextText.trim()) break;
     }
@@ -520,7 +520,7 @@ async function processImage(req, res) {
         "Only count a substantive answer or an explicit unreadable statement. Checklist mentions alone do not count.",
         "INVENTORY:\\n"+inventory,
         "COMBINED ANSWER:\\n"+answer
-      ].join("\\n\\n");
+      ].join("\n\n");
       const finalAudit=parseJson((await callGemini([{text:finalAuditPrompt}],2048)).text||"");
       missing=Array.isArray(finalAudit.missing)?finalAudit.missing.map(String):questions.map(q=>q.id);
     }
