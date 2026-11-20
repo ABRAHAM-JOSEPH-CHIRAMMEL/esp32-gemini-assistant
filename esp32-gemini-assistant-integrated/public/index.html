@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gemini OLED Simulator</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}
+body{margin:0;padding:24px;background:#0b1220;color:#edf5ff;font:15px system-ui,Segoe UI,sans-serif}
+main{max-width:1100px;margin:auto}h1{margin:0 0 5px;font-size:28px}
+.muted{color:#9fb0c5}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:20px}
+.panel{background:#121d2e;border:1px solid #26364d;border-radius:14px;padding:18px}
+textarea,input[type=password],input[type=text]{width:100%;background:#08101c;color:#e8f4ff;border:1px solid #34465f;border-radius:9px;padding:11px;font:14px Consolas,monospace}
+textarea{min-height:190px;line-height:1.5}
+.math-preview{background:#f8fbff;color:#111827;border:1px solid #34465f;border-radius:9px;padding:16px;min-height:120px;max-height:420px;overflow:auto;line-height:1.65;font-size:16px}
+.math-preview mjx-container{color:#111827}
+.math-preview .answer-line{white-space:pre-wrap;margin:3px 0}
+.math-preview mjx-container[display="true"]{overflow-x:auto;overflow-y:hidden;padding:5px 0}
+button{border:1px solid #38506c;border-radius:8px;background:#1b2d43;color:#eef7ff;padding:9px 13px;font-weight:650;cursor:pointer;margin:8px 5px 0 0}
+button.primary{background:#087eaa}button:disabled{opacity:.45;cursor:not-allowed}
+input[type=file]{display:block;width:100%;margin:10px 0;color:#dcecff}
+label{display:block;margin:12px 0 6px;font-weight:600}
+.screen{aspect-ratio:4/1;width:100%;background:#061b2a;border:8px solid #263747;border-radius:7px;padding:5px 8px;display:grid;grid-template-rows:repeat(4,1fr);overflow:hidden;box-shadow:inset 0 0 24px #000}
+.line{font:clamp(10px,1.6vw,16px)/1.15 "Courier New",monospace;color:#e8faff;white-space:pre;overflow:hidden}
+.status{display:flex;justify-content:space-between;color:#74d7ff;font:12px Consolas,monospace;margin-top:12px}
+.note{font-size:13px;line-height:1.45;color:#aebed1}
+#message{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:12px;font:13px Consolas,monospace;color:#9fe5ff}
+#preview{max-width:100%;max-height:260px;display:none;margin-top:10px;border-radius:8px;border:1px solid #34465f}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+@media(max-width:700px){.grid{grid-template-columns:1fr}body{padding:14px}}
+</style>
+</head>
+<body><main>
+<h1>Gemini Study Assistant – OLED Simulator</h1>
+<div class="muted">128 × 32 SSD1306-style preview · four rows · approximately 21 characters per row</div>
+<div class="grid">
+<section class="panel">
+<b>1. Scan a question-paper image</b>
+<p class="muted">Choose a clear JPG, PNG or WebP image. The simulator sends it to this same website's Render backend.</p>
+<label for="imageFile">Question-paper image</label>
+<input id="imageFile" type="file" accept="image/jpeg,image/png,image/webp">
+<img id="preview" alt="Selected question paper preview">
+<p class="note" style="color:#79e6a2">Ready to scan · no device token required.</p>
+<p class="note">Your Gemini API key and ESP32 DEVICE_TOKEN remain on Render. This browser uses the same-origin route; no device token is needed.</p>
+<label for="prompt">Instruction to Gemini</label>
+<textarea id="prompt" style="min-height:105px">Read the uploaded study question paper carefully. Identify every visible question and provide accurate, detailed educational answers. Include relevant formulas, derivations and calculation steps. Do not invent unreadable text. MATHEMATICAL FORMATTING IS IMPORTANT: Use standard LaTeX math notation for every equation and symbol, enclosed in \( ... \) inline or $$ ... $$ for displayed equations. Write Greek letters using LaTeX commands such as \\alpha, \\beta, \\lambda, \\psi, \\theta, \\pi, \\Delta. Use proper LaTeX for fractions (\\frac{a}{b}), integrals (\\int), sums (\\sum), vectors (\\vec{E}), subscripts (\\beta_{phase}) and superscripts. Never spell a Greek symbol as an English word inside an equation (write \\beta_{phase}, not beta_phase). Keep explanatory prose readable. Do not omit derivation steps.</textarea>
+<div class="row">
+<button class="primary" id="scan">SCAN WITH GEMINI</button>
+<button id="clear">Clear image</button>
+</div>
+<div id="message" role="status">Ready. Select an image. The permanent Gemini instruction is applied automatically.</div>
+<hr style="border-color:#26364d;margin:18px 0">
+<b>2. Gemini answer</b>
+<p class="muted">The answer received from Render will appear here automatically. You can also paste text manually for display testing.</p>
+<textarea id="answer" spellcheck="false" placeholder="Gemini's answer will appear here after scanning..."></textarea>
+<div class="muted" style="margin:12px 0 6px">ANSWER-PAPER MATHEMATICS PREVIEW</div>
+<div id="mathPreview" class="math-preview">Properly typeset equations and fractions will appear here.</div>
+<div class="row">
+<button class="primary" id="load">Update OLED</button>
+<button id="prev">◀ Previous</button><button id="next">Next ▶</button>
+</div>
+<p><button id="play">▶ Auto-scroll</button> <label style="display:inline-block">Speed <input id="speed" type="range" min="500" max="3000" step="250" value="1500" style="vertical-align:middle"></label> <span id="speedLabel">1.50 s</span></p>
+<div class="note">Text is wrapped into four-line display pages, like the 128 × 32 OLED.</div>
+</section>
+<section class="panel">
+<div class="muted" style="margin-bottom:12px">VIRTUAL SSD1306 DISPLAY</div>
+<div class="screen"><div class="line" id="l0"></div><div class="line" id="l1"></div><div class="line" id="l2"></div><div class="line" id="l3"></div></div>
+<div class="status"><span>GEMINI RESPONSE</span><span id="page">1 / 1</span></div>
+<p class="muted">This previews text layout and scrolling. It does not simulate camera hardware or electrical behaviour.</p>
+</section>
+</div></main>
+
+<script>
+window.MathJax = {
+ tex: {
+  inlineMath: [['\\(','\\)']],
+  displayMath: [['$$','$$'], ['\\[','\\]']],
+  processEscapes: true
+ },
+ options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] }
+};
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+
+<script>
+const API_URL='/api/browser-solve';
+const input=document.getElementById('answer'),els=[0,1,2,3].map(i=>document.getElementById('l'+i));
+
+let pages=[],idx=0,timer=null;
+function renderMathPreview(){
+ const target=document.getElementById('mathPreview');
+ const raw=input.value || '';
+ if(!raw.trim()){target.textContent='Properly typeset equations and fractions will appear here.';return}
+ // Escape HTML, preserve newlines, and let MathJax typeset TeX delimiters.
+ const escaped=raw.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+ target.innerHTML=escaped.split('\n').map(line=>'<div class="answer-line">'+(line||'&nbsp;')+'</div>').join('');
+ if(window.MathJax && window.MathJax.typesetPromise){
+  MathJax.typesetClear([target]);
+  MathJax.typesetPromise([target]).catch(err=>console.warn('MathJax render:',err));
+ }
+}
+
+function matchingBrace(text, openAt){
+ let depth=0;
+ for(let i=openAt;i<text.length;i++){
+  if(text[i]==='{')depth++;
+  else if(text[i]==='}'){
+   depth--;
+   if(depth===0)return i;
+  }
+ }
+ return -1;
+}
+function replaceLatexFractions(text){
+ let out='',i=0;
+ while(i<text.length){
+  let m=text.slice(i).match(/^\\(?:dfrac|tfrac|frac)\s*\{/);
+  if(!m){out+=text[i++];continue}
+  let firstOpen=i+m[0].lastIndexOf('{');
+  let firstEnd=matchingBrace(text,firstOpen);
+  if(firstEnd<0){out+=text[i++];continue}
+  let j=firstEnd+1;
+  while(text[j]===' ')j++;
+  if(text[j]!=='{'){out+=text[i++];continue}
+  let secondEnd=matchingBrace(text,j);
+  if(secondEnd<0){out+=text[i++];continue}
+  const numerator=replaceLatexFractions(text.slice(firstOpen+1,firstEnd));
+  const denominator=replaceLatexFractions(text.slice(j+1,secondEnd));
+  out+='('+numerator+')/('+denominator+')';
+  i=secondEnd+1;
+ }
+ return out;
+}
+function cleanForOLED(s){
+ let t=String(s).replace(/\r/g,'');
+ t=t.replace(/^\s{0,3}#{1,6}\s*/gm,'')
+  .replace(/\*\*(.*?)\*\*/gs,'$1')
+  .replace(/__(.*?)__/gs,'$1')
+  .replace(/\*(.*?)\*/gs,'$1')
+  .replace(/`{1,3}/g,'')
+  .replace(/\$\$?/g,'')
+  .replace(/\\\[|\\\]|\\\(|\\\)/g,'');
+
+ t=replaceLatexFractions(t);
+ // Repair Greek-symbol names returned as plain words, e.g. beta_phase -> β_phase.
+ const greekWords = {
+  alpha:'α', beta:'β', gamma:'γ', delta:'δ', epsilon:'ε',
+  zeta:'ζ', eta:'η', theta:'θ', iota:'ι', kappa:'κ',
+  lambda:'λ', mu:'μ', nu:'ν', xi:'ξ', omicron:'ο',
+  pi:'π', rho:'ρ', sigma:'σ', tau:'τ', upsilon:'υ',
+  phi:'φ', chi:'χ', psi:'ψ', omega:'ω',
+  Gamma:'Γ', Delta:'Δ', Theta:'Θ', Lambda:'Λ',
+  Xi:'Ξ', Pi:'Π', Sigma:'Σ', Phi:'Φ', Psi:'Ψ', Omega:'Ω'
+ };
+ for (const [word,symbol] of Object.entries(greekWords)) {
+  const re = new RegExp('\\\\\\\\'+word+'\\\\\\\\b','g');
+  t=t.replace(re,symbol);
+  const plain = new RegExp('\\\\b'+word+'(?=_|\\\\b)','g');
+  t=t.replace(plain,symbol);
+ }
+ const map=[
+  [/\\vec\s*\{([^{}]*)\}/g,'$1⃗'],
+  [/\\hat\s*\{([^{}]*)\}/g,'$1 hat'],
+  [/\\bar\s*\{([^{}]*)\}/g,'$1 bar'],
+  [/\\overline\s*\{([^{}]*)\}/g,'$1 bar'],
+  [/\\underline\s*\{([^{}]*)\}/g,'$1'],
+  [/\\sqrt\s*\{([^{}]*)\}/g,'√($1)'],
+  [/\\int\b/g,'∫'], [/\\iint\b/g,'∬'],
+  [/\\iiint\b/g,'∭'], [/\\oint\b/g,'∮'],
+  [/\\sum\b/g,'∑'], [/\\prod\b/g,'∏'],
+  [/\\nabla\b/g,'∇'], [/\\partial\b/g,'∂'],
+  [/\\in\b/g,' in '], [/\\notin\b/g,' not in '],
+  [/\\lambda\b/g,'λ'], [/\\psi\b/g,'ψ'],
+  [/\\theta\b/g,'θ'], [/\\phi\b/g,'φ'],
+  [/\\alpha\b/g,'α'], [/\\beta\b/g,'β'],
+  [/\\gamma\b/g,'γ'], [/\\delta\b/g,'δ'],
+  [/\\pi\b/g,'π'], [/\\mu\b/g,'μ'],
+  [/\\sigma\b/g,'σ'], [/\\omega\b/g,'ω'],
+  [/\\Delta\b/g,'Δ'], [/\\epsilon\b/g,'ε'],
+  [/\\cos\b/g,'cos'], [/\\sin\b/g,'sin'],
+  [/\\tan\b/g,'tan'], [/\\log\b/g,'log'],
+  [/\\cdot\b/g,' · '], [/\\times\b/g,' × '],
+  [/\\pm\b/g,' ± '], [/\\leq?\b/g,' ≤ '],
+  [/\\geq?\b/g,' ≥ '], [/\\neq\b/g,' ≠ '],
+  [/\\approx\b/g,' ≈ '],
+  [/\\infty\b/g,'∞'], [/\\circ\b/g,'°'],
+  [/\\left\b|\\right\b/g,''],
+  [/\\quad\b|\\qquad\b/g,' '],
+  [/\\mathrm\s*\{([^{}]*)\}/g,'$1'],
+  [/\\text\s*\{([^{}]*)\}/g,'$1'],
+  [/\\mathbf\s*\{([^{}]*)\}/g,'$1'],
+  [/\\,|\\;|\\!/g,' ']
+ ];
+ for(const [pattern,replacement] of map)t=t.replace(pattern,replacement);
+ t=t.replace(/\^\s*\{([^{}]*)\}/g,'^($1)')
+  .replace(/_\s*\{([^{}]*)\}/g,'_$1')
+  .replace(/[{}]/g,'')
+  .replace(/\\[a-zA-Z]+/g,'')
+  .replace(/[ \t]+/g,' ')
+  .replace(/ *\n */g,'\n')
+  .replace(/^\s*[-*+]\s+/gm,'- ')
+  .trim();
+ return t;
+}
+function wrap(s){
+ s=cleanForOLED(s);
+ let a=[];
+ for(let raw of String(s).replace(/\r/g,'').split('\n')){
+  if(!raw){a.push('');continue}
+  let line='';
+  for(let w of raw.split(/\s+/)){
+   while(w.length>21){if(line){a.push(line);line=''}a.push(w.slice(0,21));w=w.slice(21)}
+   if(!w)continue;
+   let c=line?line+' '+w:w;
+   if(c.length>21){if(line)a.push(line);line=w}else line=c;
+  }
+  if(line)a.push(line);
+ }
+ if(!a.length)a=[''];while(a.length%4)a.push('');
+ let p=[];for(let i=0;i<a.length;i+=4)p.push(a.slice(i,i+4));return p;
+}
+function draw(){
+ let p=pages[idx]||['','','',''];els.forEach((e,i)=>e.textContent=p[i]||'');
+ document.getElementById('page').textContent=(pages.length?idx+1:0)+' / '+pages.length;
+ document.getElementById('prev').disabled=idx===0;
+ document.getElementById('next').disabled=idx>=pages.length-1;
+}
+function load(){pages=wrap(input.value);idx=0;draw();renderMathPreview()}
+function stop(){if(timer)clearInterval(timer);timer=null;document.getElementById('play').textContent='▶ Auto-scroll'}
+document.getElementById('load').onclick=()=>{stop();load()};
+document.getElementById('prev').onclick=()=>{stop();idx=Math.max(0,idx-1);draw()};
+document.getElementById('next').onclick=()=>{stop();idx=Math.min(pages.length-1,idx+1);draw()};
+document.getElementById('play').onclick=()=>{
+ if(timer){stop();return}
+ if(idx>=pages.length-1)idx=0;
+ document.getElementById('play').textContent='Ⅱ Pause';
+ timer=setInterval(()=>{if(idx<pages.length-1){idx++;draw()}else stop()},+document.getElementById('speed').value);
+};
+document.getElementById('speed').oninput=()=>{
+ document.getElementById('speedLabel').textContent=(+document.getElementById('speed').value/1000).toFixed(2)+' s';
+ if(timer){stop();document.getElementById('play').click()}
+};
+const fileInput=document.getElementById('imageFile');
+const message=document.getElementById('message');
+fileInput.addEventListener('change',()=>{
+ const f=fileInput.files[0],img=document.getElementById('preview');
+ if(!f){img.style.display='none';return}
+ if(!['image/jpeg','image/png','image/webp'].includes(f.type)){message.textContent='Please choose a JPG, PNG or WebP image.';fileInput.value='';img.style.display='none';return}
+ img.src=URL.createObjectURL(f);img.style.display='block';
+ message.textContent='Image selected: '+f.name;
+});
+document.getElementById('clear').onclick=()=>{
+ fileInput.value='';const img=document.getElementById('preview');img.removeAttribute('src');img.style.display='none';
+ message.textContent='Image cleared.';
+};
+document.getElementById('scan').onclick=async()=>{
+ const file=fileInput.files[0];
+ if(!file){message.textContent='Select a question-paper image first.';return}
+ const btn=document.getElementById('scan');btn.disabled=true;btn.textContent='SCANNING...';
+ message.textContent='Uploading image to Render. The first request may take a little longer if the free service is waking up...';
+ try{
+  const form=new FormData();form.append('image',file,file.name);
+  form.append('prompt',document.getElementById('prompt').value);
+  const response=await fetch(API_URL,{method:'POST',body:form});
+  const raw=await response.text();let data;
+  try{data=JSON.parse(raw)}catch{throw new Error('Server returned a non-JSON response: '+raw.slice(0,350))}
+  if(!response.ok)throw new Error(data.error||data.message||('HTTP '+response.status));
+  if(data.success===false)throw new Error(data.error||data.message||'Gemini request failed.');
+  const answer=data.answer??data.text??data.output??data.result??data.response?.text??data.response;
+  if(typeof answer!=='string'||!answer.trim()){
+   throw new Error('The server responded, but the answer field was not found. Response: '+JSON.stringify(data).slice(0,700));
+  }
+  input.value=answer;stop();load();message.textContent='Success! Gemini answer received and loaded onto the virtual OLED.';
+  document.querySelector('.screen').scrollIntoView({behavior:'smooth',block:'center'});
+ }catch(err){
+  message.textContent='Scan failed: '+err.message+'\n\nCheck your internet connection and Render deployment. The simulator and API are served from the same website.';
+ }finally{btn.disabled=false;btn.textContent='SCAN WITH GEMINI'}
+};
+load();
+input.addEventListener('input',renderMathPreview);
+</script></body></html>
