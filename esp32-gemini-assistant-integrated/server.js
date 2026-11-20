@@ -550,8 +550,12 @@ async function processImage(req, res) {
       ].join("\n\n");
       const audit=parseJson((await callGemini([{text:auditPrompt}],2048)).text||"");
       answered=Array.isArray(audit.answered)?audit.answered.map(String):[];
-      missing=Array.isArray(audit.missing)?audit.missing.map(String):questions.map(q=>q.id);
       unclear=Array.isArray(audit.unclear)?audit.unclear.map(String):[];
+      const reportedMissing=Array.isArray(audit.missing)?audit.missing.map(String):[];
+      const accountedFor=new Set([...answered,...unclear]);
+      // Fail closed: an inventory ID omitted by the auditor is not silently
+      // treated as complete; send it through the targeted repair stage.
+      missing=[...new Set([...reportedMissing,...questions.filter(q=>!accountedFor.has(q.id)).map(q=>q.id)])];
       auditPerformed=true;
     } catch(auditError) {
       console.warn("Completeness audit unavailable; preserving generated answer:",auditError?.message||auditError);
@@ -580,8 +584,10 @@ async function processImage(req, res) {
         ].join("\n\n");
         const finalAudit=parseJson((await callGemini([{text:finalAuditPrompt}],2048)).text||"");
         answered=Array.isArray(finalAudit.answered)?finalAudit.answered.map(String):answered;
-        missing=Array.isArray(finalAudit.missing)?finalAudit.missing.map(String):missing;
         unclear=Array.isArray(finalAudit.unclear)?finalAudit.unclear.map(String):unclear;
+        const finalReportedMissing=Array.isArray(finalAudit.missing)?finalAudit.missing.map(String):missing;
+        const finalAccountedFor=new Set([...answered,...unclear]);
+        missing=[...new Set([...finalReportedMissing,...questions.filter(q=>!finalAccountedFor.has(q.id)).map(q=>q.id)])];
       } catch(repairError) {
         console.warn("Repair/re-audit incomplete; preserving available answer:",repairError?.message||repairError);
       }
