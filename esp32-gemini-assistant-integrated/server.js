@@ -21,7 +21,7 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_PROMPT_LENGTH = 16000;
 
 const MODEL =
-  process.env.GEMINI_MODEL || "gemini-3.6-flash";
+  process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
 const MAX_OUTPUT_TOKENS = Number(
   process.env.MAX_OUTPUT_TOKENS || 8192
@@ -402,7 +402,7 @@ app.get("/health", (req, res) => {
     status: "online",
     service: "ESP32 Gemini Study Assistant",
     model: MODEL,
-    fallbackConfigured: Boolean(process.env.GEMINI_API_KEY_FALLBACK),
+    fallbackConfigured: Boolean(process.env.GEMINI_API_KEY_FALLBACK),\n    alternateModelConfigured: Boolean(process.env.GEMINI_ALTERNATE_MODEL),
     permanentPrompt: true,
     multipartPartsLimit: "unrestricted",
     browserRoute: "/api/browser-solve",
@@ -424,15 +424,21 @@ async function processImage(req, res) {
     if (additionalPrompt.length > MAX_PROMPT_LENGTH) return res.status(400).json({ success:false, error:"Additional instruction is too long." });
     // Primary + optional independent fallback credentials/model.
     // A second key should belong to a separately quota-managed Google AI project.
-    const aiTargets = [
-      { ai:new GoogleGenAI({ apiKey:process.env.GEMINI_API_KEY }), model:MODEL, label:"primary" }
-    ];
+    const aiTargets = [];
+    const primaryAI = new GoogleGenAI({ apiKey:process.env.GEMINI_API_KEY });
+    aiTargets.push({ ai:primaryAI, model:MODEL, label:"primary" });
+    // A model-specific quota can be exhausted while another model on the
+    // same project remains available. Configure this independently if desired.
+    if (process.env.GEMINI_ALTERNATE_MODEL && process.env.GEMINI_ALTERNATE_MODEL !== MODEL) {
+      aiTargets.push({ ai:primaryAI, model:process.env.GEMINI_ALTERNATE_MODEL, label:"same-project alternate model" });
+    }
     if (process.env.GEMINI_API_KEY_FALLBACK) {
-      aiTargets.push({
-        ai:new GoogleGenAI({ apiKey:process.env.GEMINI_API_KEY_FALLBACK }),
-        model:process.env.GEMINI_FALLBACK_MODEL || MODEL,
-        label:"fallback"
-      });
+      const fallbackAI = new GoogleGenAI({ apiKey:process.env.GEMINI_API_KEY_FALLBACK });
+      const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || MODEL;
+      aiTargets.push({ ai:fallbackAI, model:fallbackModel, label:"separate-project fallback" });
+      if (process.env.GEMINI_ALTERNATE_MODEL && process.env.GEMINI_ALTERNATE_MODEL !== fallbackModel) {
+        aiTargets.push({ ai:fallbackAI, model:process.env.GEMINI_ALTERNATE_MODEL, label:"fallback alternate model" });
+      }
     }
     const imagePart = { inlineData:{ mimeType:detectedType, data:req.file.buffer.toString("base64") } };
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -525,45 +531,61 @@ async function processImage(req, res) {
       finishReason=continuation.candidates?.[0]?.finishReason||null;
       if(!nextText.trim()) break;
     }
-    // Stage 3: independent audit against unique inventory IDs, not labels alone.
-    const auditPrompt=[
-      "Audit whether each inventory ID has a substantive answer in the answer sheet.",
-      "Return ONLY JSON: {\"answered\":[\"Q1\"],\"missing\":[\"Q2\"],\"unclear\":[\"Q3\"]}.",
-      "A checklist mention alone does not count as an answer. A substantive solution or explicit unreadable statement is required.",
-      "Treat OR alternatives as separate IDs. Never infer an answer from a neighbouring question.",
-      "INVENTORY:\n"+inventory,
-      "ANSWER SHEET:\n"+answer
-    ].join("\n\n");
-    const auditResult=await callGemini([{text:auditPrompt}],2048);
-    const audit=parseJson(auditResult.text||"");
-    const answered=Array.isArray(audit.answered)?audit.answered.map(String):[];
-    let missing=Array.isArray(audit.missing)?audit.missing.map(String):questions.map(q=>q.id);
-    const unclear=Array.isArray(audit.unclear)?audit.unclear.map(String):[];
-    // Stage 4: one repair pass for missing inventory IDs.
+    // Stage 3: audit is best-effort. Never discard a generated answer
+    // merely because the separate audit request hits quota or service limits.
+    let auditPerformed=false;
+    let answered=[];
+    let missing=questions.map(q=>q.id);
+    let unclear=[];
     let repairAttempted=false;
-    if(missing.length){
-      repairAttempted=true;
-      const repairPrompt=[
-        "Answer ONLY these missing inventory IDs. Do not repeat existing answers.",
-        "Use the original uploaded paper. Preserve printed question labels and give complete exam-ready explanations, numerical steps and derivations.",
-        "If the image does not provide enough readable information, say so explicitly rather than guessing.",
-        "MISSING INVENTORY ITEMS:\n"+questions.filter(q=>missing.includes(q.id)).map(q=>q.id+" | "+q.label+" | "+q.description).join("\n"),
-        "EXISTING ANSWER SHEET FOR CONTEXT:\n"+answer
+    try {
+      const auditPrompt=[
+        "Audit whether each inventory ID has a substantive answer in the answer sheet.",
+        "Return ONLY JSON: {\"answered\":[\"Q1\"],\"missing\":[\"Q2\"],\"unclear\":[\"Q3\"]}.",
+        "A checklist mention alone does not count as an answer. A substantive solution or explicit unreadable statement is required.",
+        "Treat OR alternatives as separate IDs. Never infer an answer from a neighbouring question.",
+        "INVENTORY:\n"+inventory,
+        "ANSWER SHEET:\n"+answer
       ].join("\n\n");
-      const repairResult=await callGemini([{text:repairPrompt},imagePart]);
-      const repairText=repairResult.text||"";
-      if(repairText.trim()) answer+="\n\n--- COMPLETION OF MISSING QUESTIONS ---\n\n"+repairText;
-      // Re-audit the repaired combined answer; repair attempt alone is not proof.
-      const finalAuditPrompt=[
-        "Re-audit the combined answer after repair. Return ONLY JSON: {\"answered\":[\"Q1\"],\"missing\":[\"Q2\"],\"unclear\":[\"Q3\"]}.",
-        "Only count a substantive answer or an explicit unreadable statement. Checklist mentions alone do not count.",
-        "INVENTORY:\\n"+inventory,
-        "COMBINED ANSWER:\\n"+answer
-      ].join("\n\n");
-      const finalAudit=parseJson((await callGemini([{text:finalAuditPrompt}],2048)).text||"");
-      missing=Array.isArray(finalAudit.missing)?finalAudit.missing.map(String):questions.map(q=>q.id);
+      const audit=parseJson((await callGemini([{text:auditPrompt}],2048)).text||"");
+      answered=Array.isArray(audit.answered)?audit.answered.map(String):[];
+      missing=Array.isArray(audit.missing)?audit.missing.map(String):questions.map(q=>q.id);
+      unclear=Array.isArray(audit.unclear)?audit.unclear.map(String):[];
+      auditPerformed=true;
+    } catch(auditError) {
+      console.warn("Completeness audit unavailable; preserving generated answer:",auditError?.message||auditError);
     }
-    const completenessVerified=missing.length===0 && unclear.length===0 && finishReason!=="MAX_TOKENS";
+
+    // Stage 4: repair only when audit succeeded and identified missing items.
+    if(auditPerformed && missing.length){
+      repairAttempted=true;
+      try {
+        const repairPrompt=[
+          "Answer ONLY these missing inventory IDs. Do not repeat existing answers.",
+          "Use the original uploaded paper. Preserve printed question labels and give complete exam-ready explanations, numerical steps and derivations.",
+          "If the image does not provide enough readable information, say so explicitly rather than guessing.",
+          "MISSING INVENTORY ITEMS:\n"+questions.filter(q=>missing.includes(q.id)).map(q=>q.id+" | "+q.label+" | "+q.description).join("\n"),
+          "EXISTING ANSWER SHEET FOR CONTEXT:\n"+answer
+        ].join("\n\n");
+        const repairResult=await callGemini([{text:repairPrompt},imagePart]);
+        const repairText=repairResult.text||"";
+        if(repairText.trim()) answer+="\n\n--- COMPLETION OF MISSING QUESTIONS ---\n\n"+repairText;
+        // Re-audit if capacity is available; if not, keep the useful repaired answer.
+        const finalAuditPrompt=[
+          "Re-audit the combined answer after repair. Return ONLY JSON: {\"answered\":[\"Q1\"],\"missing\":[\"Q2\"],\"unclear\":[\"Q3\"]}.",
+          "Only count a substantive answer or an explicit unreadable statement. Checklist mentions alone do not count.",
+          "INVENTORY:\n"+inventory,
+          "COMBINED ANSWER:\n"+answer
+        ].join("\n\n");
+        const finalAudit=parseJson((await callGemini([{text:finalAuditPrompt}],2048)).text||"");
+        answered=Array.isArray(finalAudit.answered)?finalAudit.answered.map(String):answered;
+        missing=Array.isArray(finalAudit.missing)?finalAudit.missing.map(String):missing;
+        unclear=Array.isArray(finalAudit.unclear)?finalAudit.unclear.map(String):unclear;
+      } catch(repairError) {
+        console.warn("Repair/re-audit incomplete; preserving available answer:",repairError?.message||repairError);
+      }
+    }
+    const completenessVerified=auditPerformed && missing.length===0 && unclear.length===0 && finishReason!=="MAX_TOKENS";
     console.log("Paper pipeline finished",{items:questions.length,missing:missing.length,unclear:unclear.length,characters:answer.length,finishReason,completenessVerified});
     return res.json({success:true,answer,model:MODEL,finishReason,questionCount:questions.length,questionNumbers:questions.map(q=>q.label),questionInventory:questions,answeredQuestions:answered,missingQuestions:missing,unclearQuestions:unclear,completenessVerified,auditPerformed:true,repairAttempted});
   } catch(error) {
