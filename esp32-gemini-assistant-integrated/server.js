@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { timingSafeEqual } from "node:crypto";
 
 // ======================================================
-// SERVER CONFIGURATION
+// CONFIGURATION
 // ======================================================
 
 const app = express();
@@ -31,31 +31,30 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "32kb" }));
 
 // ======================================================
-// SAME-ORIGIN BROWSER CONFIGURATION
+// SAME-ORIGIN STATIC WEBSITE
 // ======================================================
-
-// The simulator and API are hosted on the same Render
-// website. Browser requests to this same origin do not
-// require CORS middleware.
 
 app.use(express.static(PUBLIC_DIR));
 
+// Browser simulator and API use the same Render origin.
+// CORS middleware is not required for same-origin requests.
+
 // ======================================================
-// REQUEST RATE LIMITING
+// RATE LIMITING
 // ======================================================
 
 const requestCounts = new Map();
 
 function rateLimit(req, res, next) {
   const now = Date.now();
-  const windowMs = 60 * 1000;
+  const windowMs = 60000;
   const maxRequests = 10;
 
-  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const ip = req.ip || "unknown";
 
   let record = requestCounts.get(ip);
 
-  if (!record || now - record.start > windowMs) {
+  if (!record || now - record.start >= windowMs) {
     record = {
       start: now,
       count: 0
@@ -68,14 +67,13 @@ function rateLimit(req, res, next) {
   if (record.count > maxRequests) {
     return res.status(429).json({
       success: false,
-      error: "Too many requests. Please wait one minute and retry."
+      error: "Too many requests. Please wait and retry."
     });
   }
 
-  // Prevent the in-memory map from growing indefinitely.
   if (requestCounts.size > 5000) {
     for (const [key, value] of requestCounts) {
-      if (now - value.start > windowMs) {
+      if (now - value.start >= windowMs) {
         requestCounts.delete(key);
       }
     }
@@ -85,22 +83,21 @@ function rateLimit(req, res, next) {
 }
 
 // ======================================================
-// IMAGE UPLOAD CONFIGURATION
+// MULTIPART IMAGE UPLOAD
+// IMPORTANT: NO PARTS OR FIELDS LIMIT
 // ======================================================
-
-// FIX: Increased fields and parts limits.
-// The simulator may send the image, prompt and other
-// form fields in the same multipart request.
 
 const upload = multer({
   storage: multer.memoryStorage(),
 
   limits: {
     fileSize: MAX_IMAGE_BYTES,
-    files: 1,
-    fields: 15,
-    parts: 20,
-    fieldSize: MAX_PROMPT_LENGTH
+    files: 1
+
+    // Intentionally no "parts" limit.
+    // Intentionally no "fields" limit.
+    // This prevents LIMIT_PART_COUNT errors caused
+    // by the simulator sending additional form fields.
   },
 
   fileFilter(req, file, callback) {
@@ -122,7 +119,6 @@ const upload = multer({
 
 // ======================================================
 // IMAGE SIGNATURE VALIDATION
-// No additional npm package required.
 // ======================================================
 
 function detectImageType(buffer) {
@@ -164,8 +160,7 @@ function detectImageType(buffer) {
 }
 
 // ======================================================
-// PERMANENT GEMINI INSTRUCTION
-// This instruction is automatically applied to every scan.
+// PERMANENT DEFAULT GEMINI INSTRUCTION
 // ======================================================
 
 const DEFAULT_GEMINI_PROMPT = `
@@ -383,7 +378,7 @@ function authenticateDevice(req, res, next) {
   if (!expectedToken) {
     return res.status(503).json({
       success: false,
-      error: "Device authentication is not configured on Render."
+      error: "Device authentication is not configured."
     });
   }
 
@@ -408,6 +403,7 @@ app.get("/health", (req, res) => {
     service: "ESP32 Gemini Study Assistant",
     model: MODEL,
     permanentPrompt: true,
+    multipartPartsLimit: "unrestricted",
     browserRoute: "/api/browser-solve",
     deviceRoute: "/api/solve"
   });
@@ -422,14 +418,14 @@ async function processImage(req, res) {
     if (!process.env.GEMINI_API_KEY) {
       return res.status(503).json({
         success: false,
-        error: "GEMINI_API_KEY is missing from Render environment variables."
+        error: "GEMINI_API_KEY is missing from Render."
       });
     }
 
     if (!req.file) {
       return res.status(400).json({
         success: false,
-        error: "No image received. Please select a question-paper image."
+        error: "No image received. Please select an image."
       });
     }
 
@@ -441,12 +437,9 @@ async function processImage(req, res) {
     ) {
       return res.status(415).json({
         success: false,
-        error: "The uploaded image is invalid or unsupported."
+        error: "Invalid or unsupported image file."
       });
     }
-
-    // Optional extra user instruction.
-    // The permanent instruction is always applied regardless.
 
     const additionalPrompt =
       typeof req.body?.prompt === "string"
@@ -460,6 +453,7 @@ async function processImage(req, res) {
       });
     }
 
+    // The permanent instruction is always applied.
     const finalPrompt =
       DEFAULT_GEMINI_PROMPT +
       (
@@ -554,14 +548,14 @@ async function processImage(req, res) {
     if (status === 503 || status === 502) {
       return res.status(503).json({
         success: false,
-        error: "Gemini is temporarily unavailable or overloaded. Please retry."
+        error: "Gemini is temporarily unavailable. Please retry."
       });
     }
 
     if (status === 401 || status === 403) {
       return res.status(status).json({
         success: false,
-        error: "Gemini authentication or permission error. Check Render environment variables."
+        error: "Gemini authentication error. Check Render environment variables."
       });
     }
 
@@ -574,7 +568,7 @@ async function processImage(req, res) {
 
 // ======================================================
 // BROWSER SIMULATOR ROUTE
-// No DEVICE_TOKEN required.
+// No device token required.
 // ======================================================
 
 app.post(
@@ -586,7 +580,7 @@ app.post(
 
 // ======================================================
 // PHYSICAL ESP32 ROUTE
-// DEVICE_TOKEN REQUIRED.
+// Device token required.
 // ======================================================
 
 app.post(
@@ -598,7 +592,7 @@ app.post(
 );
 
 // ======================================================
-// ERROR HANDLING
+// UPLOAD ERROR HANDLER
 // ======================================================
 
 app.use((error, req, res, next) => {
@@ -606,16 +600,20 @@ app.use((error, req, res, next) => {
     return next(error);
   }
 
-  console.error(
-    "Request error:",
-    error?.message || error
-  );
+  console.error("Request error:", error?.message || error);
 
   if (error instanceof multer.MulterError) {
     if (error.code === "LIMIT_FILE_SIZE") {
       return res.status(413).json({
         success: false,
         error: "Image exceeds the 5 MB upload limit."
+      });
+    }
+
+    if (error.code === "LIMIT_FILE_COUNT") {
+      return res.status(400).json({
+        success: false,
+        error: "Only one image can be uploaded at a time."
       });
     }
 
@@ -632,7 +630,7 @@ app.use((error, req, res, next) => {
 });
 
 // ======================================================
-// ROOT FALLBACK
+// ROOT ROUTE
 // ======================================================
 
 app.get("/", (req, res) => {
@@ -657,6 +655,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Permanent study assistant prompt loaded.");
   console.log("Browser route: /api/browser-solve");
   console.log("ESP32 route: /api/solve");
-  console.log("Multipart limits: 1 image, 15 fields, 20 total parts.");
-  console.log("Same-origin browser requests: CORS not required.");
+  console.log("Multipart total-parts limit: REMOVED");
+  console.log("Maximum image size: 5 MB");
 });
