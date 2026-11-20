@@ -303,7 +303,7 @@ MODULE / SECTION
 
 Question number
 
-Question statement, if readable.
+Question label only; do not reproduce the full question statement.
 
 Answer:
 
@@ -459,7 +459,7 @@ async function processImage(req, res) {
       "Do NOT reproduce the complete question statements. Give the answer only under each question label.",
       "For numericals show Given, Required, formula, substitution, calculations, units and final result.",
       "For derivations show assumptions, starting equation, intermediate steps and final expression.",
-      "Use LaTeX delimiters \( ... \) inline and \[ ... \] for display equations. Do not omit important steps to fit the OLED; firmware handles paging.",
+      "Use LaTeX delimiters \\( ... \\) inline and \\[ ... \\] for display equations. Do not omit important steps to fit the OLED; firmware handles paging.",
       "If the image is unclear, state this under that item; never guess.",
       "End with a compact checklist using the inventory IDs Q1, Q2, etc. Mark ANSWERED or UNREADABLE only when justified. If truncated, state the last completed ID and next pending ID.",
       "COMPLETE EXTRACTED INVENTORY (preserve order):\n"+inventory,
@@ -497,6 +497,15 @@ async function processImage(req, res) {
       const repairResult=await callGemini([{text:repairPrompt},imagePart]);
       const repairText=repairResult.text||"";
       if(repairText.trim()) answer+="\n\n--- COMPLETION OF MISSING QUESTIONS ---\n\n"+repairText;
+      // Re-audit the repaired combined answer; repair attempt alone is not proof.
+      const finalAuditPrompt=[
+        "Re-audit the combined answer after repair. Return ONLY JSON: {\\"answered\\":[\\"Q1\\"],\\"missing\\":[\\"Q2\\"],\\"unclear\\":[\\"Q3\\"]}.",
+        "Only count a substantive answer or an explicit unreadable statement. Checklist mentions alone do not count.",
+        "INVENTORY:\\n"+inventory,
+        "COMBINED ANSWER:\\n"+answer
+      ].join("\\n\\n");
+      const finalAudit=parseJson((await callGemini([{text:finalAuditPrompt}],2048)).text||"");
+      missing=Array.isArray(finalAudit.missing)?finalAudit.missing.map(String):questions.map(q=>q.id);
     }
     const completenessVerified=missing.length===0 && unclear.length===0 && finishReason!=="MAX_TOKENS";
     console.log("Paper pipeline finished",{items:questions.length,missing:missing.length,unclear:unclear.length,characters:answer.length,finishReason,completenessVerified});
