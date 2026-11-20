@@ -43,7 +43,7 @@ const upload = multer({
     fileSize: MAX_IMAGE_BYTES,
     files: 1,
     fields: 1,
-    parts: 2,
+    parts: 5,
     fieldSize: 2048
   },
   fileFilter(req, file, callback) {
