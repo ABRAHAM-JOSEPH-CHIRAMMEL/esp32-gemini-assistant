@@ -278,7 +278,8 @@ document.getElementById('scan').onclick=async()=>{
  message.textContent='Uploading image to Render. The first request may take a little longer if the free service is waking up...';
  try{
   message.textContent='Preparing image for faster upload...';
-  const uploadFile=await prepareUploadImage(file);\n  const form=new FormData();form.append('image',uploadFile,uploadFile.name);
+  const uploadFile=await prepareUploadImage(file);
+  const form=new FormData();form.append('image',uploadFile,uploadFile.name);
   const extra=document.getElementById('prompt').value.trim();if(extra)form.append('prompt',extra);
   message.textContent='Uploading '+(uploadFile.size/1024).toFixed(0)+' KB to Render and processing the paper...';
   const response=await fetch(API_URL,{method:'POST',body:form});
