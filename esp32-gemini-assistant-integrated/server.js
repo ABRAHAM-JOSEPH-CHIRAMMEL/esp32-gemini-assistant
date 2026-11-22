@@ -32,33 +32,25 @@ const MAX_OUTPUT_TOKENS = Number(
 // Convert the complete answer to printable ASCII pages for a 128x32,
 // 5x7-font OLED (21 columns x 4 rows). Keep the full answer separately.
 function makeOledPages(source) {
-  let text=String(source||"").replace(/\\r/g,"");
-  const replacements={
-    "α":"alpha","β":"beta","γ":"gamma","δ":"delta","ε":"epsilon","θ":"theta",
-    "λ":"lambda","μ":"mu","π":"pi","ρ":"rho","σ":"sigma","φ":"phi","ψ":"psi","ω":"omega",
-    "Δ":"Delta","Γ":"Gamma","Ω":"Omega","Σ":"Sigma","Φ":"Phi","Ψ":"Psi",
-    "√":"sqrt","∫":"integral","∬":"double integral","∭":"triple integral","∮":"contour integral",
-    "∑":"sum","∏":"product","∂":"d","∇":"grad","∞":"infinity","×":" x ","·":" * ",
-    "÷":"/","±":"+/-","≤":"<=","≥":">=","≠":"!=","≈":"~=","→":"->","←":"<-",
-    "↔":"<->","°":" deg ","²":"^2","³":"^3","—":"-","–":"-","…":"..."
-  };
+  let text=String(source||"").replace(/\r/g,"");
+  const replacements={"α":"alpha","β":"beta","γ":"gamma","δ":"delta","ε":"epsilon","θ":"theta","λ":"lambda","μ":"mu","π":"pi","ρ":"rho","σ":"sigma","φ":"phi","ψ":"psi","ω":"omega","Δ":"Delta","Γ":"Gamma","Ω":"Omega","Σ":"Sigma","Φ":"Phi","Ψ":"Psi","√":"sqrt","∫":"integral","∬":"double integral","∭":"triple integral","∮":"contour integral","∑":"sum","∏":"product","∂":"d","∇":"grad","∞":"infinity","×":" x ","·":" * ","÷":"/","±":"+/-","≤":"<=","≥":">=","≠":"!=","≈":"~=","→":"->","←":"<-","↔":"<->","°":" deg ","²":"^2","³":"^3","—":"-","–":"-","…":"..."};
   text=Array.from(text,ch=>replacements[ch]??ch).join("");
-  text=text.replace(/\\\\(?:alpha|beta|gamma|delta|epsilon|theta|lambda|mu|pi|rho|sigma|phi|psi|omega|Delta|Gamma|Omega)/g,m=>m.slice(2))
-    .replace(/\\\\(?:sqrt)\\s*\\{([^{}]*)\\}/g,"sqrt($1)")
-    .replace(/\\\\(?:frac|dfrac|tfrac)\\s*\\{([^{}]*)\\}\\s*\\{([^{}]*)\\}/g,"($1)/($2)")
-    .replace(/\\\\(?:int|sum|prod|partial|nabla|infty)/g,m=>({"\\\\int":"integral","\\\\sum":"sum","\\\\prod":"product","\\\\partial":"d","\\\\nabla":"grad","\\\\infty":"infinity"}[m]||""))
-    .replace(/\\\\(?:times|cdot)/g," * ").replace(/\\\\pm/g," +/- ")
-    .replace(/\\\\(?:leq|le)/g," <= ").replace(/\\\\(?:geq|ge)/g," >= ")
-    .replace(/\\\\neq/g," != ").replace(/\\\\(?:left|right)/g,"")
-    .replace(/\\\\[a-zA-Z]+/g,"").replace(/[{}$*_#`]/g,"")
-    .replace(/\\s*\\|\\s*/g,"  ")
-    .replace(/[^\\x20-\\x7E\\n\\t]/g,"")
-    .replace(/[ \\t]+/g," ").trim();
+  text=text.replace(/\\(?:alpha|beta|gamma|delta|epsilon|theta|lambda|mu|pi|rho|sigma|phi|psi|omega|Delta|Gamma|Omega)\b/g,m=>m.slice(1))
+    .replace(/\\sqrt\s*\{([^{}]*)\}/g,"sqrt($1)")
+    .replace(/\\(?:frac|dfrac|tfrac)\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g,"($1)/($2)")
+    .replace(/\\(?:int|sum|prod|partial|nabla|infty)\b/g,m=>({"\\int":"integral","\\sum":"sum","\\prod":"product","\\partial":"d","\\nabla":"grad","\\infty":"infinity"}[m]||""))
+    .replace(/\\(?:times|cdot)\b/g," * ").replace(/\\pm\b/g," +/- ")
+    .replace(/\\(?:leq|le)\b/g," <= ").replace(/\\(?:geq|ge)\b/g," >= ")
+    .replace(/\\neq\b/g," != ").replace(/\\(?:left|right)\b/g,"")
+    .replace(/\\[a-zA-Z]+/g,"").replace(/[{}$*_#\`]/g,"")
+    .replace(/\s*\|\s*/g,"  ")
+    .replace(/[^\x20-\x7E\n\t]/g,"")
+    .replace(/[ \t]+/g," ").trim();
   const lines=[];
-  for(const raw of text.split("\\n")) {
+  for(const raw of text.split("\n")) {
     if(!raw){lines.push("");continue;}
     let line="";
-    for(let word of raw.split(/\\s+/)) {
+    for(let word of raw.split(/\s+/)) {
       while(word.length>21) {
         if(line){lines.push(line);line="";}
         lines.push(word.slice(0,21));word=word.slice(21);
@@ -76,7 +68,6 @@ function makeOledPages(source) {
   for(let i=0;i<lines.length;i+=4)pages.push(lines.slice(i,i+4));
   return pages;
 }
-
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "32kb" }));
